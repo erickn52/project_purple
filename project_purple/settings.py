@@ -1,42 +1,33 @@
-"""
-settings.py
-Strategy-level defaults and trading parameters.
-These do NOT belong in .env (those are for secrets & environment-specific values).
-"""
+# project_purple/settings.py
+from dataclasses import dataclass
 
-# ----------------------------
-# PRICE FILTERS
-# ----------------------------
-MIN_PRICE = 12.0
-MAX_PRICE = 60.0
 
-# ----------------------------
-# VOLUME FILTERS
-# ----------------------------
-# Minimum average daily dollar volume (liquidity filter)
-MIN_DOLLAR_VOLUME = 2_000_000     # $2M
+@dataclass
+class StrategySettings:
+    # Universe filters
+    min_price: float = 12.0
+    max_price: float = 60.0
 
-# ----------------------------
-# MOMENTUM FILTERS
-# ----------------------------
-# % gain over X days for momentum screen
-MOMENTUM_LOOKBACK_DAYS = 5
-MIN_MOMENTUM_PCT = 4.0    # require at least +4% move
+    # Average dollar volume filter (price * volume)
+    # We want reasonably liquid names with tight spreads.
+    min_avg_dollar_volume: float = 2_000_000  # 2 million USD
 
-# ----------------------------
-# RISK MANAGEMENT
-# ----------------------------
-# Stop-loss distances
-STOP_LOSS_PCT = 2.0        # 2% default risk
-TRAILING_STOP_PCT = 1.5    # optional trailing stop
+    # Sectors / industries we want to avoid completely
+    exclude_sectors: tuple[str, ...] = ("Biotechnology", "Biotech")
 
-# ----------------------------
-# POSITION SIZING
-# ----------------------------
-RISK_PER_TRADE = 0.01      # 1% of account per trade
+    # Risk management
+    risk_per_trade: float = 0.0075  # 0.75% of account equity per trade
+    max_positions: int = 8
+    max_portfolio_risk: float = 0.20  # 20% of equity at risk if all stops are hit
 
-# ----------------------------
-# GENERAL SETTINGS
-# ----------------------------
-VERBOSE = True             # print debug information
-LOG_TRADES = True          # write trades to logs (later)
+    # Stops & targets (use ATR for volatility-adjusted exits)
+    atr_period: int = 14
+    atr_multiple_stop: float = 2.0
+    atr_multiple_target: float = 3.0
+
+    # Holding & regime filters
+    max_holding_days: int = 10           # cap on how long we hold a swing
+    min_trend_lookback_days: int = 20    # for basic "is it trending?" checks
+
+
+strategy_settings = StrategySettings()

@@ -1,151 +1,144 @@
-"""
-data_loader.py
-
-Historical data access layer using IB (via ib_insync).
-
-Responsibilities:
-- Define contracts (e.g., US stocks)
-- Request historical OHLCV bars from IB
-- Convert to pandas DataFrame
-- Save to CSV in the project's data folder
-"""
+# project_purple/data_loader.py
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
 import pandas as pd
-from ib_insync import Stock, util  # type: ignore
 
-from . import config
-from .ib_client import ib_client
+from project_purple.config import config
+from project_purple.ib_client import IBClient
 
 
-def make_stock_contract(symbol: str, exchange: str = "SMART", currency: str = "USD") -> Stock:
+# Where the bars come from
+BarSource = Literal["csv", "ib"]
+
+
+@dataclass
+class PriceBar:
     """
-    Create an IB Stock contract for a US-listed stock.
-
-    Parameters
-    ----------
-    symbol : str
-        Ticker symbol, e.g. 'AAPL'
-    exchange : str
-        Exchange route, usually 'SMART'
-    currency : str
-        Currency, usually 'USD'
-
-    Returns
-    -------
-    Stock
-        ib_insync Stock contract object
+    Simple structure representing a single OHLCV bar.
+    We mostly use DataFrames, but this documents the schema.
     """
-    return Stock(symbol, exchange, currency)
+    symbol: str
+    date: pd.Timestamp
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
 
 
-def get_daily_bars(
-    symbol: str,
-    lookback_days: int = 90,
-    use_rth: bool = True,
-    what_to_show: str = "TRADES",
-    save_csv: bool = True,
-) -> Optional[pd.DataFrame]:
+def _standardize_df(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
     """
-    Request historical daily bars from IB and optionally save to CSV.
+    Ensure we always get the same columns and index format.
 
-    Parameters
-    ----------
-    symbol : str
-        Ticker symbol, e.g. 'AAPL'
-    lookback_days : int
-        How many calendar days of history to request (IB limitation).
-    use_rth : bool
-        If True, only use Regular Trading Hours (no pre/post market).
-    what_to_show : str
-        IB 'whatToShow' parameter. 'TRADES' is usually appropriate.
-    save_csv : bool
-        If True, save the resulting DataFrame to a CSV under data/.
-
-    Returns
-    -------
-    Optional[pd.DataFrame]
-        DataFrame indexed by datetime with OHLCV columns.
-        Returns None if the request fails or no data returned.
+    Final format:
+        index: DatetimeIndex named 'date'
+        columns: symbol, open, high, low, close, volume
     """
-    # Ensure IB is connected
-    if not ib_client.is_connected():
-        connected = ib_client.connect()
-        if not connected:
-            print("DataLoader: Could not connect to IB, aborting historical data request.")
-            return None
 
-    contract = make_stock_contract(symbol)
+    # If there is an explicit date column, use it as index
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+    elif "Date" in df.columns:
+        df["Date"] = pd.to_datetime(df["Date"])
+        df.set_index("Date", inplace=True)
+        df.index.name = "date"
+    else:
+        # assume the index is already a date-like index
+        df.index = pd.to_datetime(df.index)
+        if df.index.name is None:
+            df.index.name = "date"
 
-    duration_str = f"{lookback_days} D"  # IB format, e.g. '90 D'
-    bar_size = "1 day"
+    # Attach symbol if provided
+    if symbol is not None:
+        df["symbol"] = symbol
 
-    print(
-        f"DataLoader: Requesting {duration_str} of {bar_size} bars for {symbol} "
-        f"(RTH={use_rth}, whatToShow={what_to_show})..."
-    )
+    # Normalize column names to lowercase
+    rename_map: dict[str, str] = {}
+    for c in df.columns:
+        lc = c.lower()
+        if lc in {"open", "high", "low", "close", "volume", "symbol"}:
+            rename_map[c] = lc
 
-    try:
-        bars = ib_client.ib.reqHistoricalData(
-            contract=contract,
-            endDateTime="",           # '' means "up to now"
-            durationStr=duration_str,
-            barSizeSetting=bar_size,
-            whatToShow=what_to_show,
-            useRTH=use_rth,
-            formatDate=1,             # human-readable datetimes
-            keepUpToDate=False,
-        )
-    except Exception as exc:
-        print(f"DataLoader: Error requesting historical data -> {exc}")
-        return None
+    if rename_map:
+        df.rename(columns=rename_map, inplace=True)
 
-    if not bars:
-        print("DataLoader: No bars returned from IB.")
-        return None
+    expected_cols = ["symbol", "open", "high", "low", "close", "volume"]
+    cols_present = [c for c in expected_cols if c in df.columns]
+    df = df[cols_present]
 
-    # Convert to DataFrame
-    df = util.df(bars)
-
-    # Normalize column names
-    df.rename(
-        columns={
-            "date": "datetime",
-            "open": "open",
-            "high": "high",
-            "low": "low",
-            "close": "close",
-            "volume": "volume",
-            "barCount": "bar_count",
-            "average": "vwap",
-        },
-        inplace=True,
-    )
-
-    # Set datetime index
-    df["datetime"] = pd.to_datetime(df["datetime"])
-    df.set_index("datetime", inplace=True)
     df.sort_index(inplace=True)
-
-    # Add simple dollar-volume column for liquidity checks
-    df["dollar_volume"] = df["close"] * df["volume"]
-
-    # Save to CSV if requested
-    if save_csv:
-        csv_path = _make_csv_path(symbol, lookback_days)
-        df.to_csv(csv_path)
-        print(f"DataLoader: Saved {len(df)} rows to {csv_path}")
 
     return df
 
 
-def _make_csv_path(symbol: str, lookback_days: int) -> Path:
+def load_from_csv(
+    symbol: str,
+    file_path: Optional[Path] = None,
+) -> pd.DataFrame:
     """
-    Build the path under the project's data folder for a symbol's daily bars.
+    Load historical data for a single symbol from a CSV file in /data.
+
+    Default filename pattern:
+        {symbol}_daily_60d.csv
+    Ex: AAPL_daily_60d.csv, NVDA_daily_60d.csv
+
+    CSV is expected to have at least:
+        Date (or date) as first column, and Open, High, Low, Close, Volume.
     """
-    file_name = f"{symbol.upper()}_daily_{lookback_days}d.csv"
-    return config.DATA_PATH / file_name
+    if file_path is None:
+        file_path = config.data_dir / f"{symbol}_daily_60d.csv"
+
+    if not file_path.exists():
+        raise FileNotFoundError(f"CSV file not found for {symbol}: {file_path}")
+
+    # Read CSV assuming first column is the date
+    df = pd.read_csv(file_path, parse_dates=[0], index_col=0)
+
+    if df.index.name is None:
+        df.index.name = "date"
+
+    df = _standardize_df(df, symbol=symbol)
+    return df
+
+
+def load_from_ib(
+    symbol: str,
+    ib_client: Optional[IBClient] = None,
+    duration: str = "60 D",
+) -> pd.DataFrame:
+    """
+    Load historical daily data from Interactive Brokers using IBClient.
+    """
+    client = ib_client or IBClient()
+    df = client.get_daily_history(symbol, duration=duration)
+    if df.empty:
+        return df
+    df = _standardize_df(df, symbol=symbol)
+    return df
+
+
+def load_history(
+    symbol: str,
+    source: BarSource = "csv",
+    ib_client: Optional[IBClient] = None,
+    duration: str = "60 D",
+) -> pd.DataFrame:
+    """
+    Public entry point for the rest of the system.
+
+    Examples:
+        df = load_history("AAPL", source="csv")
+        df = load_history("AAPL", source="ib", ib_client=IBClient())
+    """
+    if source == "csv":
+        return load_from_csv(symbol)
+    elif source == "ib":
+        return load_from_ib(symbol, ib_client=ib_client, duration=duration)
+    else:
+        raise ValueError(f"Unknown data source: {source}")

@@ -1,93 +1,101 @@
-"""
-ib_client.py
-Thin wrapper around ib_insync.IB for connecting to Interactive Brokers.
+# project_purple/ib_client.py
 
-This module uses the config values defined in config.py and exposes a
-single shared IBClient instance (`ib_client`) for the rest of the app.
+from __future__ import annotations
 
-Safety:
-- Use TWS/Gateway PAPER account.
-- Keep API in read-only mode while testing.
-"""
-
-from datetime import datetime
+from contextlib import contextmanager
 from typing import Optional
 
-from ib_insync import IB  # type: ignore
+import pandas as pd
+from ib_insync import IB, Stock, util  # type: ignore
 
-from . import config
+from project_purple.config import config
 
 
 class IBClient:
-    def __init__(self) -> None:
+    """
+    Thin wrapper around ib_insync.IB for Project Purple.
+    Handles connectivity and raw historical data retrieval.
+    """
+
+    def __init__(
+        self,
+        host: Optional[str] = None,
+        port: Optional[int] = None,
+        client_id: Optional[int] = None,
+    ) -> None:
+        self.host = host or config.ib_host
+        self.port = port or config.ib_port
+        self.client_id = client_id or config.ib_client_id
         self.ib = IB()
 
-    # ------------------------
-    # CONNECTION MANAGEMENT
-    # ------------------------
-    def connect(self) -> bool:
-        """
-        Connect to IB using host/port/clientId from config.py.
-        Returns True if connected, False otherwise.
-        """
-        if self.ib.isConnected():
-            print("IB: Already connected.")
-            return True
-
-        print(
-            f"IB: Connecting to {config.IB_HOST}:{config.IB_PORT} "
-            f"with clientId={config.IB_CLIENT_ID}..."
-        )
-
-        try:
-            self.ib.connect(
-                host=config.IB_HOST,
-                port=config.IB_PORT,
-                clientId=config.IB_CLIENT_ID,
-                readonly=True,  # extra safety layer
-            )
-        except Exception as exc:
-            print(f"IB: Connection error -> {exc}")
-            return False
-
-        if self.ib.isConnected():
-            print("IB: Connected successfully.")
-            return True
-
-        print("IB: Failed to connect (unknown reason).")
-        return False
+    def connect(self) -> None:
+        if not self.ib.isConnected():
+            self.ib.connect(self.host, self.port, clientId=self.client_id)
 
     def disconnect(self) -> None:
-        """Disconnect from IB if currently connected."""
         if self.ib.isConnected():
             self.ib.disconnect()
-            print("IB: Disconnected.")
-        else:
-            print("IB: Not connected; nothing to disconnect.")
 
-    def is_connected(self) -> bool:
-        """Return True if connected to IB, else False."""
-        return self.ib.isConnected()
-
-    # ------------------------
-    # SIMPLE TEST HELPERS
-    # ------------------------
-    def get_server_time(self) -> Optional[datetime]:
+    @contextmanager
+    def session(self):
         """
-        Return the IB server time if connected, otherwise None.
-        This is a safe way to confirm the API is working.
+        Usage:
+            with IBClient().session() as client:
+                df = client.get_daily_history("AAPL")
         """
-        if not self.ib.isConnected():
-            print("IB: Not connected; cannot get server time.")
-            return None
-
+        self.connect()
         try:
-            server_time = self.ib.reqCurrentTime()
-            return server_time
-        except Exception as exc:
-            print(f"IB: Error requesting server time -> {exc}")
-            return None
+            yield self
+        finally:
+            self.disconnect()
 
+    def get_daily_history(
+        self,
+        symbol: str,
+        duration: str = "60 D",
+        bar_size: str = "1 day",
+        what_to_show: str = "TRADES",
+        use_rth: bool = True,
+    ) -> pd.DataFrame:
+        """
+        Fetch daily historical bars for a US stock from Interactive Brokers
+        and return them as a standardized pandas DataFrame.
+        """
+        self.connect()
 
-# A single shared instance for convenience:
-ib_client = IBClient()
+        contract = Stock(symbol, "SMART", "USD")
+        bars = self.ib.reqHistoricalData(
+            contract,
+            endDateTime="",
+            durationStr=duration,
+            barSizeSetting=bar_size,
+            whatToShow=what_to_show,
+            useRTH=use_rth,
+            formatDate=1,
+        )
+
+        df = util.df(bars)
+
+        if df.empty:
+            return df
+
+        # Standardize
+        df.rename(
+            columns={
+                "date": "date",
+                "open": "open",
+                "high": "high",
+                "low": "low",
+                "close": "close",
+                "volume": "volume",
+            },
+            inplace=True,
+        )
+
+        df["symbol"] = symbol
+        df["date"] = pd.to_datetime(df["date"])
+        df.set_index("date", inplace=True)
+
+        df = df[["symbol", "open", "high", "low", "close", "volume"]].sort_index()
+
+        return df

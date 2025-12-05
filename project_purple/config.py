@@ -1,54 +1,42 @@
-from pathlib import Path
+# project_purple/config.py
+
+from __future__ import annotations
+
 import os
+from dataclasses import dataclass
+from pathlib import Path
 
 from dotenv import load_dotenv
 
-# Base directory of the project (top level folder)
-BASE_DIR = Path(__file__).resolve().parent.parent
 
-# Path to the .env file
-ENV_PATH = BASE_DIR / ".env"
+# Base directory of the project (top-level project_purple folder)
+BASE_DIR = Path(__file__).resolve().parents[1]
 
-# Load environment variables from .env if it exists
-if ENV_PATH.exists():
-    load_dotenv(ENV_PATH)
-else:
-    # Optional: helpful warning if .env is missing
-    print(f"WARNING: .env file not found at {ENV_PATH}. Using default values where possible.")
-
-# --- Interactive Brokers settings ---
-
-IB_HOST = os.getenv("IB_HOST", "127.0.0.1")
-IB_PORT = int(os.getenv("IB_PORT", "7497"))
-IB_CLIENT_ID = int(os.getenv("IB_CLIENT_ID", "1"))
-
-# --- Paths ---
-
-DATA_PATH = BASE_DIR / os.getenv("DATA_PATH", "data")
-
-# Ensure data directory exists
-DATA_PATH.mkdir(parents=True, exist_ok=True)
-
-# --- Strategy defaults (we'll actually use these later) ---
-
-MIN_PRICE = float(os.getenv("MIN_PRICE", "12"))
-MAX_PRICE = float(os.getenv("MAX_PRICE", "60"))
-MIN_AVG_DOLLAR_VOLUME = float(os.getenv("MIN_AVG_DOLLAR_VOLUME", "2000000"))
+# Load environment variables from .env in the project root
+load_dotenv(BASE_DIR / ".env")
 
 
-def show_config_summary() -> None:
+@dataclass
+class AppConfig:
     """
-    Simple helper to print the current configuration.
-    Useful for debugging and sanity checks.
+    Application configuration for Project Purple.
+    Anything related to environment, paths, and external services
+    (like Interactive Brokers) lives here.
     """
-    print("=== Swing Trader Configuration ===")
-    print(f"BASE_DIR:          {BASE_DIR}")
-    print(f"ENV_PATH:          {ENV_PATH}")
-    print(f"IB_HOST:           {IB_HOST}")
-    print(f"IB_PORT:           {IB_PORT}")
-    print(f"IB_CLIENT_ID:      {IB_CLIENT_ID}")
-    print(f"DATA_PATH:         {DATA_PATH}")
-    print(f"MIN_PRICE:         {MIN_PRICE}")
-    print(f"MAX_PRICE:         {MAX_PRICE}")
-    print(f"MIN_$VOLUME:       {MIN_AVG_DOLLAR_VOLUME}")
-    print("==================================")
+
+    # Environment (dev, backtest, live, etc.)
+    env: str = os.getenv("ENV", "dev")
+
+    # Paths
+    data_dir: Path = BASE_DIR / "data"
+    docs_dir: Path = BASE_DIR / "docs"
+    log_dir: Path = BASE_DIR / "logs"
+
+    # Interactive Brokers connection settings
+    ib_host: str = os.getenv("IB_HOST", "127.0.0.1")
+    ib_port: int = int(os.getenv("IB_PORT", "7497"))
+    ib_client_id: int = int(os.getenv("IB_CLIENT_ID", "1"))
+
+
+# Single global config instance the rest of the app can import
+config = AppConfig()
