@@ -1,0 +1,14 @@
+this is a trading program called project_purple. it is meant to be my way to give to my family and not be a burden in the future.
+this project runs on python. run main.py
+current components:
+config.py, settings.py
+
+data_loader.py
+
+ib_client.py
+
+indicators.py
+
+signals.py
+
+backtest.py
