@@ -1,9 +1,10 @@
 from project_purple import config, settings
 from project_purple.ib_client import ib_client
+from project_purple.data_loader import get_daily_bars
 
 
 def main():
-    # 1) Show config & settings (sanity check)
+    # 1) Show config & settings
     config.show_config_summary()
 
     print("\n=== STRATEGY SETTINGS ===")
@@ -14,17 +15,21 @@ def main():
     print("==================================\n")
 
     # 2) Connect to IB
-    connected = ib_client.connect()
-    if not connected:
+    if not ib_client.connect():
         print("Could not connect to IB. Make sure TWS/Gateway is running and API is enabled.")
         return
 
-    # 3) Request server time as a simple, safe test call
-    server_time = ib_client.get_server_time()
-    if server_time is not None:
-        print(f"IB server time: {server_time}")
+    # 3) Request some historical data as a test
+    test_symbol = "NVDA"   # you can change this to any liquid stock you like
+    lookback_days = 60
+
+    df = get_daily_bars(symbol=test_symbol, lookback_days=lookback_days, save_csv=True)
+
+    if df is not None:
+        print(f"\nLoaded {len(df)} rows of daily data for {test_symbol}.")
+        print(df.tail(5))  # show the last few rows
     else:
-        print("Failed to retrieve server time.")
+        print("No data returned.")
 
     # 4) Disconnect cleanly
     ib_client.disconnect()

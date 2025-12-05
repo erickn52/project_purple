@@ -1,5 +1,45 @@
+# -------------------------
+# Python & Virtual Environment
+# -------------------------
 venv/
-.idea/
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+
+# -------------------------
+# IDE / Editor Files (PyCharm, IntelliJ)
+# -------------------------
+.idea/
+*.iml
+
+# -------------------------
+# Environment Variables
+# -------------------------
 .env
+
+# -------------------------
+# Data Files (CSV, HDF5, Parquet, etc.)
+# Prevent repo from ballooning
+# -------------------------
+data/*.csv
+data/*.json
+data/*.parquet
+data/*.h5
+
+# -------------------------
+# Logs, Outputs, Checkpoints
+# -------------------------
+logs/
+*.log
+
+# Model checkpoints (if you ever build ML models)
+checkpoints/
+models/
+
+# -------------------------
+# Cache, Temp Files
+# -------------------------
+*.cache
+*.tmp
+.DS_Store
