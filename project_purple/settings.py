@@ -20,7 +20,7 @@ class StrategySettings:
     atr_multiple_target: float = 3.0
 
     # Maximum time in a trade (bars)
-    max_holding_days: int = 10
+    max_holding_days: int = 30
 
 
 strategy_settings = StrategySettings()
