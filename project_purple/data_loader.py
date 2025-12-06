@@ -14,6 +14,44 @@ ROOT_DIR = Path(__file__).resolve().parent          # inner project_purple
 DATA_DIR = ROOT_DIR / "data"
 
 
+def _parse_date_column(series: pd.Series) -> pd.Series:
+    """
+    Heuristically detect the date format for a column and parse it.
+
+    Handles:
+      - '12/7/2020' style (mm/dd/YYYY)
+      - '2020-12-07' style (YYYY-mm-dd)
+    And ignores junk rows like 'Ticker' or 'date'.
+    """
+    s = series.astype(str).str.strip()
+
+    sample: Optional[str] = None
+    for v in s:
+        if not v:
+            continue
+        lower = v.lower()
+        if lower in ("ticker", "date"):
+            continue
+        sample = v
+        break
+
+    fmt: Optional[str] = None
+    if sample is not None:
+        if "/" in sample:
+            # e.g. 12/7/2020
+            fmt = "%m/%d/%Y"
+        elif "-" in sample:
+            # e.g. 2020-12-07
+            fmt = "%Y-%m-%d"
+
+    if fmt is not None:
+        # Use a specific format => no warnings, faster
+        return pd.to_datetime(s, format=fmt, errors="coerce")
+    else:
+        # Fallback: let pandas/dateutil figure it out
+        return pd.to_datetime(s, errors="coerce")
+
+
 def load_from_csv(symbol: str, limit_days: Optional[int] = None) -> pd.DataFrame:
     """
     Load OHLCV data for a symbol from data/{SYMBOL}_daily.csv.
@@ -48,16 +86,9 @@ def load_from_csv(symbol: str, limit_days: Optional[int] = None) -> pd.DataFrame
         date_col = df.columns[0]
 
     # --------------------------------------------------
-    # 2) Convert that column to datetime, flexibly
-    #    infer_datetime_format=True handles both:
-    #      - 12/7/2020
-    #      - 2020-12-07
+    # 2) Parse dates with our heuristic
     # --------------------------------------------------
-    df[date_col] = pd.to_datetime(
-        df[date_col],
-        errors="coerce",
-        infer_datetime_format=True,
-    )
+    df[date_col] = _parse_date_column(df[date_col])
 
     # --------------------------------------------------
     # 3) Drop rows where date could not be parsed
