@@ -2,143 +2,119 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Optional
 
 import pandas as pd
 
-from project_purple.config import config
-from project_purple.ib_client import IBClient
+# ----------------------------------------------------------------------
+# Resolve correct data directory: project_purple/data
+# ----------------------------------------------------------------------
+ROOT_DIR = Path(__file__).resolve().parent          # inner project_purple
+DATA_DIR = ROOT_DIR / "data"
 
 
-# Where the bars come from
-BarSource = Literal["csv", "ib"]
-
-
-@dataclass
-class PriceBar:
+def load_from_csv(symbol: str, limit_days: Optional[int] = None) -> pd.DataFrame:
     """
-    Simple structure representing a single OHLCV bar.
-    We mostly use DataFrames, but this documents the schema.
+    Load OHLCV data for a symbol from data/{SYMBOL}_daily.csv.
+
+    Handles BOTH:
+      1. Clean files created by data_downloader.py:
+         date,symbol,open,high,low,close,volume
+      2. Yahoo-style messy files where:
+         - the first column holds dates
+         - first few rows may be 'Ticker', 'date', etc.
+
+    Returns a standardized DataFrame with:
+        index   = DatetimeIndex named 'date'
+        columns = ['symbol', 'open', 'high', 'low', 'close', 'volume']
     """
-    symbol: str
-    date: pd.Timestamp
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+    path = DATA_DIR / f"{symbol}_daily.csv"
 
+    if not path.exists():
+        raise FileNotFoundError(f"CSV file not found for {symbol}: {path}")
 
-def _standardize_df(df: pd.DataFrame, symbol: str | None = None) -> pd.DataFrame:
-    """
-    Ensure we always get the same columns and index format.
+    # Read raw CSV with no date parsing
+    df = pd.read_csv(path)
 
-    Final format:
-        index: DatetimeIndex named 'date'
-        columns: symbol, open, high, low, close, volume
-    """
-
-    # If there is an explicit date column, use it as index
+    # --------------------------------------------------
+    # 1) Decide which column is the date column
+    # --------------------------------------------------
     if "date" in df.columns:
-        df["date"] = pd.to_datetime(df["date"])
-        df.set_index("date", inplace=True)
-    elif "Date" in df.columns:
-        df["Date"] = pd.to_datetime(df["Date"])
-        df.set_index("Date", inplace=True)
-        df.index.name = "date"
+        # Clean format: explicit 'date' column
+        date_col = "date"
     else:
-        # assume the index is already a date-like index
-        df.index = pd.to_datetime(df.index)
-        if df.index.name is None:
-            df.index.name = "date"
+        # Yahoo-style: first column holds date-ish values
+        date_col = df.columns[0]
 
-    # Attach symbol if provided
-    if symbol is not None:
-        df["symbol"] = symbol
+    # --------------------------------------------------
+    # 2) Convert that column to datetime, flexibly
+    #    infer_datetime_format=True handles both:
+    #      - 12/7/2020
+    #      - 2020-12-07
+    # --------------------------------------------------
+    df[date_col] = pd.to_datetime(
+        df[date_col],
+        errors="coerce",
+        infer_datetime_format=True,
+    )
 
-    # Normalize column names to lowercase
-    rename_map: dict[str, str] = {}
-    for c in df.columns:
-        lc = c.lower()
-        if lc in {"open", "high", "low", "close", "volume", "symbol"}:
-            rename_map[c] = lc
+    # --------------------------------------------------
+    # 3) Drop rows where date could not be parsed
+    #    (this removes 'Ticker', 'date', etc.)
+    # --------------------------------------------------
+    df = df[~df[date_col].isna()]
 
-    if rename_map:
-        df.rename(columns=rename_map, inplace=True)
+    if df.empty:
+        raise ValueError(f"No valid rows after parsing dates in {path}")
 
-    expected_cols = ["symbol", "open", "high", "low", "close", "volume"]
-    cols_present = [c for c in expected_cols if c in df.columns]
-    df = df[cols_present]
-
+    # --------------------------------------------------
+    # 4) Set datetime index
+    # --------------------------------------------------
+    df.set_index(date_col, inplace=True)
+    df.index.name = "date"
     df.sort_index(inplace=True)
 
-    return df
+    # --------------------------------------------------
+    # 5) Ensure numeric types for OHLCV
+    # --------------------------------------------------
+    numeric_cols = ["open", "high", "low", "close", "volume"]
+    for col in numeric_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Optional: trim to last N days
+    if limit_days is not None:
+        df = df.tail(limit_days)
 
-def load_from_csv(
-    symbol: str,
-    file_path: Optional[Path] = None,
-) -> pd.DataFrame:
-    """
-    Load historical data for a single symbol from a CSV file in /data.
+    # --------------------------------------------------
+    # 6) Validate required columns
+    # --------------------------------------------------
+    expected_cols = ["symbol", "open", "high", "low", "close", "volume"]
+    missing = [c for c in expected_cols if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing columns in {path}: {missing}")
 
-    Default filename pattern:
-        {symbol}_daily_60d.csv
-    Ex: AAPL_daily_60d.csv, NVDA_daily_60d.csv
-
-    CSV is expected to have at least:
-        Date (or date) as first column, and Open, High, Low, Close, Volume.
-    """
-    if file_path is None:
-        file_path = config.data_dir / f"{symbol}_daily_60d.csv"
-
-    if not file_path.exists():
-        raise FileNotFoundError(f"CSV file not found for {symbol}: {file_path}")
-
-    # Read CSV assuming first column is the date
-    df = pd.read_csv(file_path, parse_dates=[0], index_col=0)
-
-    if df.index.name is None:
-        df.index.name = "date"
-
-    df = _standardize_df(df, symbol=symbol)
-    return df
-
-
-def load_from_ib(
-    symbol: str,
-    ib_client: Optional[IBClient] = None,
-    duration: str = "60 D",
-) -> pd.DataFrame:
-    """
-    Load historical daily data from Interactive Brokers using IBClient.
-    """
-    client = ib_client or IBClient()
-    df = client.get_daily_history(symbol, duration=duration)
-    if df.empty:
-        return df
-    df = _standardize_df(df, symbol=symbol)
-    return df
+    # Return in consistent column order
+    return df[expected_cols]
 
 
 def load_history(
     symbol: str,
-    source: BarSource = "csv",
-    ib_client: Optional[IBClient] = None,
-    duration: str = "60 D",
+    source: str = "csv",
+    limit_days: Optional[int] = None,
 ) -> pd.DataFrame:
     """
-    Public entry point for the rest of the system.
+    Unified history loader.
 
-    Examples:
-        df = load_history("AAPL", source="csv")
-        df = load_history("AAPL", source="ib", ib_client=IBClient())
+    Currently supports:
+      - source="csv": load from local data/{SYMBOL}_daily.csv
+
+    (Later we can add 'ib' to load from Interactive Brokers.)
     """
+    source = source.lower().strip()
+
     if source == "csv":
-        return load_from_csv(symbol)
-    elif source == "ib":
-        return load_from_ib(symbol, ib_client=ib_client, duration=duration)
-    else:
-        raise ValueError(f"Unknown data source: {source}")
+        return load_from_csv(symbol, limit_days=limit_days)
+
+    raise NotImplementedError(f"Unknown data source: {source}")

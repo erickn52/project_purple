@@ -16,11 +16,24 @@ class StrategySettings:
     max_position_pct: float = 0.20
 
     # Stop/target expressed in ATR units
-    atr_multiple_stop: float = 2.0
-    atr_multiple_target: float = 3.0
+    # We’re increasing stop distance so NVDA-style volatility doesn’t
+    # immediately knock us out, and targeting a larger reward.
+    atr_multiple_stop: float = 3.0
+    atr_multiple_target: float = 6.0
 
-    # Maximum time in a trade (bars)
+    # Trailing stop expressed in ATR units (used to ratchet up the stop)
+    atr_trailing_multiple: float = 3.0
+
+    # Volatility filter: compare fast ATR to a slower ATR average
+    # Only trade when atr_14 <= atr_vol_max_mult * atr_slow
+    atr_vol_window: int = 50
+    atr_vol_max_mult: float = 1.5
+
+    # Maximum time in a trade (bars) – safety net, not primary exit
     max_holding_days: int = 30
+
+    # Use market-wide regime filter (SPY trend) if available
+    use_market_regime: bool = True
 
 
 strategy_settings = StrategySettings()

@@ -1,3 +1,5 @@
+# project_purple/backtest.py
+
 from __future__ import annotations
 
 from typing import Tuple
@@ -14,8 +16,9 @@ def run_simple_backtest(
 ) -> Tuple[pd.DataFrame, float]:
     """
     Long-only backtest for one symbol with:
-      - ATR-based stop and target
+      - ATR-based initial stop and target
       - Risk-based position sizing + max position cap
+      - ATR-based trailing stop (follow the trend)
       - Trend-based exit (environment change)
       - Optional max holding days as a safety net
 
@@ -35,7 +38,7 @@ def run_simple_backtest(
     entry_price = 0.0
     entry_date = None
     shares = 0
-    stop_price = 0.0
+    stop_price = 0.0  # this will act as our trailing stop
     target_price = 0.0
     bars_held = 0
     risk_dollars_actual = 0.0  # actual risk used for this trade
@@ -73,30 +76,46 @@ def run_simple_backtest(
                 entry_price = entry_price_candidate
                 entry_date = next_date
 
+                # Initial stop and target
                 stop_price = entry_price - stop_dist
-                target_price = entry_price + strategy_settings.atr_multiple_target * atr
+                target_price = (
+                    entry_price
+                    + strategy_settings.atr_multiple_target * atr
+                )
 
+                # Actual risk in dollars, based on initial stop
                 risk_dollars_actual = shares * stop_dist
 
                 in_position = True
                 bars_held = 0
 
         else:
-            # POSITION MANAGEMENT using next day's bar
+            # POSITION MANAGEMENT
+
             bars_held += 1
 
+            # Update trailing stop using *today's* close and ATR
+            row_close = float(row["close"])
+            row_atr = float(row.get("atr_14", 0.0))
+            if row_atr > 0:
+                trail_dist = strategy_settings.atr_trailing_multiple * row_atr
+                new_trailing = row_close - trail_dist
+                # Trailing stop can only move up (for a long)
+                if new_trailing > stop_price:
+                    stop_price = new_trailing
+
+            # Now manage using *next day's* bar
             low = float(next_row["low"])
             high = float(next_row["high"])
             close = float(next_row["close"])
 
-            # We need today's trend context too
             ema20 = float(next_row.get("ema_20", close))
             ema50 = float(next_row.get("ema_50", close))
 
             exit_price = None
             exit_reason = None
 
-            # 1) Stop-loss (assume worse-case ordering)
+            # 1) Stop-loss (trailing)
             if low <= stop_price:
                 exit_price = stop_price
                 exit_reason = "stop"

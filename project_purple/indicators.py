@@ -2,101 +2,47 @@
 
 from __future__ import annotations
 
-from typing import Iterable
-
-import numpy as np
 import pandas as pd
+from ta.volatility import AverageTrueRange
+
+from project_purple.settings import strategy_settings
 
 
-def ema(series: pd.Series, period: int) -> pd.Series:
+def add_basic_trend_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Exponential moving average for a price series.
+    Add core indicators needed by the strategy:
+      - ema_20, ema_50 (trend)
+      - atr_14 (volatility)
+      - high_20d (breakout level)
+      - atr_slow, atr_vol_ratio (for volatility filter)
     """
-    return series.ewm(span=period, adjust=False).mean()
+    df = df.copy()
 
+    # Trend EMAs
+    df["ema_20"] = df["close"].ewm(span=20, adjust=False).mean()
+    df["ema_50"] = df["close"].ewm(span=50, adjust=False).mean()
 
-def add_ema(df: pd.DataFrame, period: int, price_col: str = "close") -> pd.DataFrame:
-    """
-    Add an EMA column to a price DataFrame.
-
-    Example:
-        df = add_ema(df, 20)
-        -> adds column 'ema_20'
-    """
-    col_name = f"ema_{period}"
-    df[col_name] = ema(df[price_col], period)
-    return df
-
-
-def true_range(df: pd.DataFrame) -> pd.Series:
-    """
-    Compute True Range.
-
-    TR_t = max(
-        high_t - low_t,
-        abs(high_t - close_{t-1}),
-        abs(low_t - close_{t-1})
+    # ATR(14)
+    atr_indicator = AverageTrueRange(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=14,
+        fillna=False,
     )
-    """
-    high = df["high"]
-    low = df["low"]
-    close = df["close"]
+    df["atr_14"] = atr_indicator.average_true_range()
 
-    prev_close = close.shift(1)
+    # 20-day high for breakout logic
+    df["high_20d"] = df["high"].rolling(window=20, min_periods=20).max()
 
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
+    # Slower ATR mean for volatility filter
+    window = strategy_settings.atr_vol_window
+    df["atr_slow"] = df["atr_14"].rolling(
+        window=window,
+        min_periods=max(10, window // 2),
+    ).mean()
 
-    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    return tr
-
-
-def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    """
-    Average True Range over a given period.
-    Uses a simple moving average of True Range.
-    """
-    tr = true_range(df)
-    return tr.rolling(window=period, min_periods=1).mean()
-
-
-def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-    """
-    Add an ATR column to the DataFrame.
-
-    Example:
-        df = add_atr(df, 14)
-        -> adds column 'atr_14'
-    """
-    col_name = f"atr_{period}"
-    df[col_name] = atr(df, period)
-    return df
-
-
-def add_basic_trend_indicators(
-    df: pd.DataFrame,
-    ema_periods: Iterable[int] = (20, 50),
-    atr_period: int = 14,
-    breakout_lookback: int = 20,
-) -> pd.DataFrame:
-    """
-    Convenience function to add the core indicators we care about for
-    Project Purple:
-
-    - EMA 20, EMA 50
-    - ATR(14)
-    - rolling 20-day high (for breakout logic)
-    """
-    # EMAs
-    for p in ema_periods:
-        df = add_ema(df, p)
-
-    # ATR
-    df = add_atr(df, atr_period)
-
-    # 20-day high breakout level (exclude today by default)
-    breakout_col = f"high_{breakout_lookback}d"
-    df[breakout_col] = df["high"].rolling(window=breakout_lookback, min_periods=1).max()
+    # Ratio of fast ATR to slow ATR
+    df["atr_vol_ratio"] = df["atr_14"] / df["atr_slow"]
 
     return df

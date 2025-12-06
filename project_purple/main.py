@@ -6,27 +6,47 @@ from project_purple.data_loader import load_history
 from project_purple.indicators import add_basic_trend_indicators
 from project_purple.signals import add_basic_long_signal
 from project_purple.backtest import run_simple_backtest
+from project_purple.settings import strategy_settings
 
 
 def main() -> None:
-    # Starting account size for the test
     initial_equity = 100_000.0
     equity = initial_equity
 
-    # Simple universe for now
     symbols = ["AAPL", "NVDA"]
 
-    for symbol in symbols:
-        # 1) Load history (from CSV for now)
-        df = load_history(symbol, source="csv")
+    # 1) Load market index (SPY) for regime filter, if enabled
+    if strategy_settings.use_market_regime:
+        try:
+            spy = load_history("SPY", source="csv")
+            spy = add_basic_trend_indicators(spy)
 
-        # 2) Add indicators (EMAs, ATR, 20d high)
+            # Simple regime rule: uptrend in SPY
+            spy["market_long_ok"] = (spy["ema_20"] > spy["ema_50"]) & (
+                spy["close"] > spy["ema_20"]
+            )
+
+            regime = spy[["market_long_ok"]]
+        except FileNotFoundError:
+            print(
+                "WARNING: SPY data not found in data/. "
+                "Regime filter will be disabled for this run."
+            )
+            regime = None
+    else:
+        regime = None
+
+    # 2) Run the strategy per symbol
+    for symbol in symbols:
+        df = load_history(symbol, source="csv")
         df = add_basic_trend_indicators(df)
 
-        # 3) Add long-entry signal
+        # attach regime info if available
+        if regime is not None:
+            df = df.join(regime, how="left")
+
         df = add_basic_long_signal(df)
 
-        # 4) Run simple backtest for this symbol
         trades_df, equity = run_simple_backtest(df, symbol, initial_equity=equity)
 
         print("=" * 80)
@@ -35,7 +55,6 @@ def main() -> None:
         if trades_df.empty:
             print("No trades generated.\n")
         else:
-            # Choose key columns to display
             cols = [
                 "symbol",
                 "entry_date",
@@ -51,7 +70,6 @@ def main() -> None:
             ]
             print(trades_df[cols], "\n")
 
-            # Simple summary stats for this symbol
             win_rate = (trades_df["R"] > 0).mean() if not trades_df.empty else 0.0
             avg_R = trades_df["R"].mean() if not trades_df.empty else 0.0
 
