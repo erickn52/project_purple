@@ -1,151 +1,134 @@
-# project_purple/data_loader.py
-
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Optional
+from typing import Dict
 
 import pandas as pd
 
-# ----------------------------------------------------------------------
-# Resolve correct data directory: project_purple/data
-# ----------------------------------------------------------------------
-ROOT_DIR = Path(__file__).resolve().parent          # inner project_purple
-DATA_DIR = ROOT_DIR / "data"
+
+# Keep this list in sync with data_downloader.TICKERS
+TICKERS = [
+    "AAPL",
+    "NVDA",
+    "SPY",
+    "TSLA",
+    "AMD",
+    "MSFT",
+    "META",
+    "AMZN",
+    "IBKR",
+    "AMDL",
+]
 
 
-def _parse_date_column(series: pd.Series) -> pd.Series:
+def get_data_dir() -> Path:
     """
-    Heuristically detect the date format for a column and parse it.
-
-    Handles:
-      - '12/7/2020' style (mm/dd/YYYY)
-      - '2020-12-07' style (YYYY-mm-dd)
-    And ignores junk rows like 'Ticker' or 'date'.
+    Return the path to the data directory:
+        .../project_purple/project_purple/data
     """
-    s = series.astype(str).str.strip()
-
-    sample: Optional[str] = None
-    for v in s:
-        if not v:
-            continue
-        lower = v.lower()
-        if lower in ("ticker", "date"):
-            continue
-        sample = v
-        break
-
-    fmt: Optional[str] = None
-    if sample is not None:
-        if "/" in sample:
-            # e.g. 12/7/2020
-            fmt = "%m/%d/%Y"
-        elif "-" in sample:
-            # e.g. 2020-12-07
-            fmt = "%Y-%m-%d"
-
-    if fmt is not None:
-        # Use a specific format => no warnings, faster
-        return pd.to_datetime(s, format=fmt, errors="coerce")
-    else:
-        # Fallback: let pandas/dateutil figure it out
-        return pd.to_datetime(s, errors="coerce")
+    project_root = Path(__file__).resolve().parents[1]
+    data_dir = project_root / "project_purple" / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
-def load_from_csv(symbol: str, limit_days: Optional[int] = None) -> pd.DataFrame:
+def load_symbol_daily(symbol: str) -> pd.DataFrame:
     """
-    Load OHLCV data for a symbol from data/{SYMBOL}_daily.csv.
+    Load a single symbol's daily data from the CSV created by data_downloader.py.
 
-    Handles BOTH:
-      1. Clean files created by data_downloader.py:
-         date,symbol,open,high,low,close,volume
-      2. Yahoo-style messy files where:
-         - the first column holds dates
-         - first few rows may be 'Ticker', 'date', etc.
+    CSV structure:
 
-    Returns a standardized DataFrame with:
-        index   = DatetimeIndex named 'date'
-        columns = ['symbol', 'open', 'high', 'low', 'close', 'volume']
+        columns: Price, symbol, open, high, low, close, volume
+
+        Row 0: Ticker,<sym>,<sym>,...,<sym>
+        Row 1: date,,,,,,
+        Row 2+: YYYY-MM-DD, <sym>, open, high, low, close, volume
+
+    This function:
+        - drops the first 2 header rows,
+        - renames 'Price' to 'date',
+        - parses 'date' as datetime,
+        - ensures numeric types for OHLCV,
+        - returns a clean DataFrame.
     """
-    path = DATA_DIR / f"{symbol}_daily.csv"
+    data_dir = get_data_dir()
+    csv_path = data_dir / f"{symbol}_daily.csv"
 
-    if not path.exists():
-        raise FileNotFoundError(f"CSV file not found for {symbol}: {path}")
+    if not csv_path.exists():
+        raise FileNotFoundError(f"CSV for {symbol} not found at: {csv_path}")
 
-    # Read raw CSV with no date parsing
-    df = pd.read_csv(path)
+    # Read entire CSV
+    raw = pd.read_csv(csv_path)
 
-    # --------------------------------------------------
-    # 1) Decide which column is the date column
-    # --------------------------------------------------
-    if "date" in df.columns:
-        # Clean format: explicit 'date' column
-        date_col = "date"
-    else:
-        # Yahoo-style: first column holds date-ish values
-        date_col = df.columns[0]
+    if raw.shape[0] < 3:
+        raise ValueError(
+            f"CSV for {symbol} looks too short (rows={raw.shape[0]}). "
+            f"Expected at least 3 rows including headers."
+        )
 
-    # --------------------------------------------------
-    # 2) Parse dates with our heuristic
-    # --------------------------------------------------
-    df[date_col] = _parse_date_column(df[date_col])
+    # Drop the first two header rows (Ticker row + date row)
+    df = raw.iloc[2:].copy()
 
-    # --------------------------------------------------
-    # 3) Drop rows where date could not be parsed
-    #    (this removes 'Ticker', 'date', etc.)
-    # --------------------------------------------------
-    df = df[~df[date_col].isna()]
+    # Rename 'Price' -> 'date'
+    if "Price" not in df.columns:
+        raise ValueError(
+            f"Expected 'Price' column in {symbol} CSV, got columns: {list(df.columns)}"
+        )
 
-    if df.empty:
-        raise ValueError(f"No valid rows after parsing dates in {path}")
+    df = df.rename(columns={"Price": "date"})
 
-    # --------------------------------------------------
-    # 4) Set datetime index
-    # --------------------------------------------------
-    df.set_index(date_col, inplace=True)
-    df.index.name = "date"
-    df.sort_index(inplace=True)
+    # Parse dates
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date"])
 
-    # --------------------------------------------------
-    # 5) Ensure numeric types for OHLCV
-    # --------------------------------------------------
+    # Ensure column order
+    expected_cols = ["date", "symbol", "open", "high", "low", "close", "volume"]
+    df = df.reindex(columns=expected_cols)
+
+    # Numeric conversion
     numeric_cols = ["open", "high", "low", "close", "volume"]
     for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+        df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Optional: trim to last N days
-    if limit_days is not None:
-        df = df.tail(limit_days)
+    # Drop rows with missing price data
+    df = df.dropna(subset=["open", "high", "low", "close"])
 
-    # --------------------------------------------------
-    # 6) Validate required columns
-    # --------------------------------------------------
-    expected_cols = ["symbol", "open", "high", "low", "close", "volume"]
-    missing = [c for c in expected_cols if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in {path}: {missing}")
+    # Symbol as string
+    df["symbol"] = df["symbol"].astype(str)
 
-    # Return in consistent column order
-    return df[expected_cols]
+    # Sort by date
+    df = df.sort_values("date").reset_index(drop=True)
+
+    return df
 
 
-def load_history(
-    symbol: str,
-    source: str = "csv",
-    limit_days: Optional[int] = None,
-) -> pd.DataFrame:
+def load_all_daily() -> Dict[str, pd.DataFrame]:
     """
-    Unified history loader.
-
-    Currently supports:
-      - source="csv": load from local data/{SYMBOL}_daily.csv
-
-    (Later we can add 'ib' to load from Interactive Brokers.)
+    Load daily data for all symbols in TICKERS into a dict:
+        { "AAPL": DataFrame, "NVDA": DataFrame, ... }
     """
-    source = source.lower().strip()
+    data: Dict[str, pd.DataFrame] = {}
 
-    if source == "csv":
-        return load_from_csv(symbol, limit_days=limit_days)
+    for symbol in TICKERS:
+        try:
+            df = load_symbol_daily(symbol)
+            data[symbol] = df
+        except Exception as e:
+            print(f"WARNING: Failed to load {symbol}: {e}")
 
-    raise NotImplementedError(f"Unknown data source: {source}")
+    return data
+
+
+if __name__ == "__main__":
+    # Simple diagnostics when you run this file directly
+    print("Testing data_loader...")
+
+    try:
+        aapl_df = load_symbol_daily("AAPL")
+        print("\nAAPL head:")
+        print(aapl_df.head())
+
+        print("\nAAPL tail:")
+        print(aapl_df.tail())
+
+        print(f"\nAAPL rows: {len(aapl_df)}")
+    except Exception as e:
+        print(f"Error while loading AAPL: {e}")
