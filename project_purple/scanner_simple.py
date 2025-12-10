@@ -16,7 +16,10 @@ MAX_PRICE = 125.0
 
 # Minimum average daily volume over the last N bars
 VOLUME_LOOKBACK = 20
-MIN_AVG_VOLUME = 750_000  # adjust later once you see how many pass
+
+# Liquidity filter:
+# - Raised from 750,000 to 1,000,000 to reduce risk of wide spreads and slippage
+MIN_AVG_VOLUME = 1_000_000
 
 # Curated list of candidate symbols.
 # This includes your original tickers plus a broader set of
