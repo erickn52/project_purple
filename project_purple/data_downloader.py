@@ -2,27 +2,20 @@ import yfinance as yf
 import pandas as pd
 from pathlib import Path
 
+# Use the same candidate universe as the scanner so everything stays in sync.
+# scanner_simple.py defines CANDIDATE_SYMBOLS, which is our curated list of
+# liquid, swing-friendly tickers across sectors.
+from scanner_simple import CANDIDATE_SYMBOLS
 
-# List of tickers we want daily data for
-# (expanded to include AMZN, IBKR, AMDL per your request)
-TICKERS = [
-    "AAPL",
-    "NVDA",
-    "SPY",
-    "TSLA",
-    "AMD",
-    "MSFT",
-    "META",
-    "AMZN",
-    "IBKR",
-    "AMDL",
-]
+# For backward compatibility in other parts of the project that may still
+# reference TICKERS, we set TICKERS = CANDIDATE_SYMBOLS.
+TICKERS = CANDIDATE_SYMBOLS
 
 
 def download_and_save_daily_data():
     """
     Download daily OHLCV data for each ticker using yfinance and save to CSV
-    in the same format as your existing AAPL_daily.csv:
+    in the same format as your existing *_daily.csv files:
 
         columns: Price, symbol, open, high, low, close, volume
 
@@ -43,6 +36,7 @@ def download_and_save_daily_data():
     data_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"Saving CSVs to: {data_dir}")
+    print(f"Tickers to download ({len(TICKERS)}): {TICKERS}")
 
     for symbol in TICKERS:
         print(f"\nDownloading {symbol} daily data with yfinance...")
@@ -57,8 +51,10 @@ def download_and_save_daily_data():
         )
 
         if hist.empty:
-            print(f"  WARNING: No data returned for {symbol}. "
-                  f"Check if the ticker is correct or too illiquid.")
+            print(
+                f"  WARNING: No data returned for {symbol}. "
+                f"Check if the ticker is correct or too illiquid."
+            )
             continue
 
         # If yfinance gives MultiIndex columns, flatten them into single strings
