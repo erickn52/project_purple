@@ -153,6 +153,7 @@ def run_backtest(
     risk_config: RiskConfig,
     initial_equity: float = 100_000.0,
     max_hold_days: int = 10,
+    trail_atr_multiple: float | None = None,
 ) -> tuple[pd.DataFrame, float]:
     """
     Run a simple long-only backtest:
@@ -160,12 +161,17 @@ def run_backtest(
       - Uses 'signal' column (1 = long regime, 0 = flat)
       - Enters when signal goes 0 -> 1
       - Exits on:
-          * stop hit
+          * stop hit (with optional ATR trailing)
           * target hit
           * signal goes 1 -> 0
           * max_hold_days reached
 
       - Position size, stop, and target are all computed by calculate_risk_for_trade.
+
+      - If trail_atr_multiple is not None, a trailing stop is applied:
+          * Each bar, stop_price is raised to (close - trail_atr_multiple * ATR)
+            if that is higher than the current stop_price.
+          * The stop never moves down.
     """
     df = df.reset_index(drop=True).copy()
 
@@ -216,7 +222,8 @@ def run_backtest(
                 current_trade = {
                     "entry_date": row["date"],
                     "entry_price": entry_price,
-                    "stop_price": stop_price,
+                    "stop_price": stop_price,             # dynamic stop (may trail)
+                    "initial_stop_price": stop_price,     # fixed for R calculation
                     "target_price": target_price,
                     "shares": shares,
                     "allowed_dollar_risk": float(risk_info["allowed_dollar_risk"]),
@@ -230,10 +237,20 @@ def run_backtest(
 
             hold_days = i - entry_index
 
+            # ---------------- Trailing stop update (if enabled) ----------------
+            if trail_atr_multiple is not None:
+                atr_today = float(row.get("atr", 0.0))
+                if atr_today > 0.0:
+                    trail_dist = trail_atr_multiple * atr_today
+                    candidate_stop = close - trail_dist
+                    # For a long, stop can only move up
+                    if candidate_stop > current_trade["stop_price"]:
+                        current_trade["stop_price"] = candidate_stop
+
             exit_price: float | None = None
             exit_reason: str | None = None
 
-            # 1) Stop-loss: if today's low touches or breaks stop
+            # 1) Stop-loss: if today's low touches or breaks (possibly trailed) stop
             if low <= current_trade["stop_price"]:
                 exit_price = current_trade["stop_price"]
                 exit_reason = "stop"
@@ -254,11 +271,11 @@ def run_backtest(
                 exit_reason = "time_exit"
 
             if exit_price is not None:
-                # Compute R and P&L
+                # Compute R and P&L (R based on INITIAL stop, not trailed stop)
                 R_value = calculate_R(
                     exit_price=exit_price,
                     entry_price=current_trade["entry_price"],
-                    stop_price=current_trade["stop_price"],
+                    stop_price=current_trade["initial_stop_price"],
                 )
 
                 pnl_dollars = (exit_price - current_trade["entry_price"]) * current_trade["shares"]
@@ -400,6 +417,7 @@ def run_backtest_for_symbol(
     risk_config: RiskConfig,
     initial_equity: float,
     max_hold_days: int,
+    trail_atr_multiple: float | None,
 ) -> tuple[pd.DataFrame, float]:
     """
     Load data for one symbol, build indicators/signals, run backtest,
@@ -429,6 +447,7 @@ def run_backtest_for_symbol(
         risk_config=risk_config,
         initial_equity=initial_equity,
         max_hold_days=max_hold_days,
+        trail_atr_multiple=trail_atr_multiple,
     )
 
     if not trades_df.empty:
@@ -461,6 +480,10 @@ def main():
     initial_equity = 100_000.0
     max_hold_days = 10
 
+    # Optional ATR trailing stop.
+    # Set to None to disable trailing and use only fixed stop/target.
+    trail_atr_multiple: float | None = 3.0
+
     # Add or remove symbols here as you like
     symbols = ["AAPL", "NVDA", "SPY", "TSLA", "AMD", "MSFT", "META"]
 
@@ -474,6 +497,7 @@ def main():
             risk_config=risk_config,
             initial_equity=initial_equity,
             max_hold_days=max_hold_days,
+            trail_atr_multiple=trail_atr_multiple,
         )
         if not trades_df.empty:
             all_trades.append(trades_df)

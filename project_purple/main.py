@@ -5,7 +5,7 @@ from __future__ import annotations
 from project_purple.data_loader import load_history
 from project_purple.indicators import add_basic_trend_indicators
 from project_purple.signals import add_basic_long_signal
-from project_purple.backtest import run_simple_backtest
+from project_purple.archive.backtest import run_simple_backtest
 from project_purple.settings import strategy_settings
 
 
