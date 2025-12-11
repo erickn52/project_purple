@@ -6,13 +6,18 @@ import pandas as pd
 
 from data_loader import load_symbol_daily
 
-
 # Basic parameters for regime detection
 REGIME_FAST_MA = 50
 REGIME_SLOW_MA = 200
 REGIME_ATR_WINDOW = 14
 
 MARKET_SYMBOL = "SPY"  # we can parameterize later if needed
+
+# Console colors
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+RESET = "\033[0m"
 
 
 @dataclass
@@ -21,11 +26,26 @@ class MarketState:
     symbol: str
     as_of_date: pd.Timestamp
     regime: str          # "BULL", "BEAR", "CHOPPY"
-    no_trade: bool       # True = do not open new trades
     close: float
     ma_fast: float
     ma_slow: float
     atr: Optional[float]
+
+    @property
+    def trade_long(self) -> bool:
+        """
+        True when it is OK to take new long trades.
+        For now: allowed in BULL or CHOPPY, blocked in BEAR.
+        """
+        return self.regime != "BEAR"
+
+    @property
+    def market_long_ok(self) -> bool:
+        """
+        Backwards-compatible alias used by other modules (signals, etc.).
+        Same meaning as trade_long.
+        """
+        return self.trade_long
 
 
 def _compute_atr(df: pd.DataFrame, window: int) -> pd.Series:
@@ -45,17 +65,6 @@ def get_market_state(symbol: str = MARKET_SYMBOL) -> MarketState:
     """
     Load daily data for the given market symbol (default SPY),
     compute regime on the most recent bar, and return a MarketState object.
-
-    Regime logic (very simple for now):
-      - BULL:  close > slow_MA and fast_MA > slow_MA
-      - BEAR:  close < slow_MA
-      - CHOPPY: everything else
-
-    no_trade flag:
-      - True  if regime == "BEAR"
-      - False otherwise
-
-    We can refine this later (e.g. add breadth, volatility filters, etc.).
     """
     df = load_symbol_daily(symbol)
 
@@ -87,14 +96,10 @@ def get_market_state(symbol: str = MARKET_SYMBOL) -> MarketState:
     else:
         regime = "CHOPPY"
 
-    # --- Simple no-trade rule (we can extend later) --------------------------
-    no_trade = regime == "BEAR"
-
     return MarketState(
         symbol=symbol,
         as_of_date=as_of_date,
         regime=regime,
-        no_trade=no_trade,
         close=close,
         ma_fast=ma_fast,
         ma_slow=ma_slow,
@@ -105,20 +110,32 @@ def get_market_state(symbol: str = MARKET_SYMBOL) -> MarketState:
 if __name__ == "__main__":
     state = get_market_state()
 
+    # Color the regime
+    if state.regime == "BULL":
+        regime_str = f"{GREEN}{state.regime}{RESET}"
+    elif state.regime == "BEAR":
+        regime_str = f"{RED}{state.regime}{RESET}"
+    else:
+        regime_str = f"{YELLOW}{state.regime}{RESET}"
+
+    trade_long_str = (
+        f"{GREEN}True{RESET}" if state.trade_long else f"{RED}False{RESET}"
+    )
+
     print("\n=== MARKET STATE ===")
-    print(f"Symbol:        {state.symbol}")
-    print(f"As of date:    {state.as_of_date}")
+    print(f"Symbol:         {state.symbol}")
+    print(f"As of date:     {state.as_of_date}")
 
-    print(f"\nRegime:        {state.regime}")
-    print(f"No trade:      {state.no_trade}")
+    print(f"\nRegime:         {regime_str}")
+    print(f"Trade long:     {trade_long_str}")
 
-    print(f"\nClose:         {state.close:.2f}")
-    print(f"50 MA:         {state.ma_fast:.2f}")
-    print(f"200 MA:        {state.ma_slow:.2f}")
+    print(f"\nClose:          {state.close:.2f}")
+    print(f"50 MA:          {state.ma_fast:.2f}")
+    print(f"200 MA:         {state.ma_slow:.2f}")
 
     if state.atr is not None:
-        print(f"ATR(14):       {state.atr:.2f}")
+        print(f"ATR(14):        {state.atr:.2f}")
     else:
-        print("ATR(14):       N/A")
+        print("ATR(14):        N/A")
 
-    print("\n")
+    print()

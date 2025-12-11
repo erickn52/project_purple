@@ -14,6 +14,13 @@ from backtest_v2 import (
 from market_state import get_market_state
 
 
+# Console colors for pretty printing
+GREEN = "\033[92m"
+RED = "\033[91m"
+YELLOW = "\033[93m"
+RESET = "\033[0m"
+
+
 def main() -> None:
     """
     Project Purple main entry point.
@@ -58,8 +65,24 @@ def main() -> None:
         market_state = get_market_state(symbol="SPY")
         print("\n===== MARKET REGIME (SPY) =====")
         print(f"As of date : {market_state.as_of_date}")
-        print(f"Regime     : {market_state.regime}")
-        print(f"No-trade?  : {market_state.no_trade}")
+
+        # Colorful regime string
+        if market_state.regime == "BULL":
+            regime_str = f"{GREEN}{market_state.regime}{RESET}"
+        elif market_state.regime == "BEAR":
+            regime_str = f"{RED}{market_state.regime}{RESET}"
+        else:
+            regime_str = f"{YELLOW}{market_state.regime}{RESET}"
+
+        # Trade long: green if True, red if False
+        trade_long_str = (
+            f"{GREEN}True{RESET}"
+            if market_state.trade_long
+            else f"{RED}False{RESET}"
+        )
+
+        print(f"Regime     : {regime_str}")
+        print(f"Trade long : {trade_long_str}")
         print(f"Close      : {market_state.close:.2f}")
         print(f"50 MA      : {market_state.ma_fast:.2f}")
         print(f"200 MA     : {market_state.ma_slow:.2f}")
@@ -72,14 +95,9 @@ def main() -> None:
         print(f"Reason: {e}")
         market_state = None
 
-    # Simple rule: if the regime says "no trade", we still run the
-    # backtest for analysis, but in the future you could choose to skip.
-    if market_state and market_state.no_trade:
-        print(
-            "\nNOTE: MarketState.no_trade is True "
-            "(e.g., BEAR regime). Backtests will still run for analysis, "
-            "but in live trading you might choose to stand aside."
-        )
+    # (Note: we no longer use a separate 'no_trade' flag here.
+    #  Trade-long behavior is described by market_state.trade_long
+    #  and can be wired into live trading later.)
 
     # --------------------------------------------------------
     # 3. Build trading universe
