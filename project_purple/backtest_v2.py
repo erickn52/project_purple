@@ -1,151 +1,150 @@
-import pandas as pd
+import warnings
 from pathlib import Path
 
+import pandas as pd
+
 from risk import RiskConfig, calculate_risk_for_trade, calculate_R
+
+
+# Backtest slippage assumption (simple model):
+# - On entry, assume you pay slightly worse than the close (buy higher).
+# - On exit, assume you receive slightly worse than the close/stop/target (sell lower).
+# This is a percentage of price per trade side (e.g., 0.001 = 0.10%).
+SLIPPAGE_PCT = 0.001
 
 
 # ------------------------------------------------------------
 # 1. DATA CLEANING & INDICATORS
 # ------------------------------------------------------------
 
+def _parse_date_series(date_series: pd.Series) -> pd.Series:
+    """
+    Robust date parsing for messy CSV exports.
+
+    Tries:
+      1) pandas format='mixed' (if supported)
+      2) fallback pd.to_datetime(errors='coerce')
+      3) if lots of NaT, try Excel serial date conversion (origin 1899-12-30)
+    """
+    s = date_series.copy()
+
+    # First attempt: "mixed" (pandas >= 2.0 supports this)
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parsed = pd.to_datetime(s, format="mixed", errors="coerce")
+    except TypeError:
+        # Older pandas: no "mixed"
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            parsed = pd.to_datetime(s, errors="coerce")
+
+    # If parsing failed for a large portion, attempt Excel serial conversion
+    if parsed.isna().mean() > 0.30:
+        serial = pd.to_numeric(s, errors="coerce")
+        mask = serial.notna()
+        if mask.any():
+            serial_parsed = pd.to_datetime(
+                serial[mask],
+                unit="D",
+                origin="1899-12-30",
+                errors="coerce",
+            )
+            parsed.loc[mask] = serial_parsed
+
+    return parsed
+
+
 def clean_aapl_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     """
     Clean the daily CSV format you showed in Excel.
 
-    Original structure:
-      Row 1: Price | symbol | open | high | low | close | volume  (headers)
-      Row 2: Ticker | XXX   | XXX  | ...                      (metadata)
-      Row 3: date | ...                                     (metadata)
-      Row 4+: actual data
+    Your CSV export can include "metadata rows" like:
+      Row 1: Price,symbol,open,high,low,close,volume   (header)
+      Row 2: Ticker,AAPL,AAPL,AAPL,AAPL,AAPL,AAPL      (not real price data)
+      Row 3: date                                     (not real price data)
+      Row 4+: actual OHLCV data
 
-    Steps:
-      - Keep row 1 as header (pandas does this by default).
-      - Drop rows where first column is 'Ticker' or 'date'.
-      - Rename 'Price' column to 'date'.
-      - Lowercase all column names.
+    We normalize to:
+      ['date','symbol','open','high','low','close','volume']
+    and remove non-data rows safely.
     """
-    first_col_name = df.columns[0]
+    df = df.copy()
 
-    # Drop metadata rows
-    df = df[~df[first_col_name].isin(["Ticker", "date"])].reset_index(drop=True)
+    # If the column is literally named "Price" and is actually date, rename it.
+    if "Price" in df.columns and "date" not in df.columns:
+        df = df.rename(columns={"Price": "date"})
 
-    # Rename 'Price' -> 'date' if present
-    rename_map = {}
-    for col in df.columns:
-        if col.strip().lower() == "price":
-            rename_map[col] = "date"
-
-    if rename_map:
-        df = df.rename(columns=rename_map)
-
-    # Standardize column names
-    df.columns = [c.strip().lower() for c in df.columns]
-
-    expected_cols = {"date", "symbol", "open", "high", "low", "close", "volume"}
-    missing = expected_cols - set(df.columns)
+    required = {"date", "symbol", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
     if missing:
-        raise ValueError(
-            f"After cleaning, missing expected columns: {missing}. "
-            f"Got columns: {list(df.columns)}"
-        )
+        raise ValueError(f"Missing required columns in CSV: {sorted(missing)}")
 
+    # Drop obvious non-data rows BEFORE parsing
+    date_str = df["date"].astype(str).str.strip()
+    bad_tokens = {"ticker", "date", "", "nan", "none"}
+    df = df[~date_str.str.lower().isin(bad_tokens)].copy()
+
+    # Ensure numeric columns (the "Ticker row" will turn into NaN and get dropped)
+    for c in ["open", "high", "low", "close", "volume"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Parse date robustly
+    df["date"] = _parse_date_series(df["date"])
+
+    # Drop rows missing key fields
+    df = df.dropna(subset=["date", "open", "high", "low", "close"])
+
+    # Sort by date
+    df = df.sort_values("date").reset_index(drop=True)
     return df
 
 
 def add_atr(df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
     """
-    Simple ATR(14) calculator using columns:
-      open, high, low, close
+    Add ATR(period) using classic True Range:
+      TR = max(high-low, abs(high-prev_close), abs(low-prev_close))
+      ATR = rolling mean of TR over 'period'
+    Adds column: 'atr'
     """
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    close = pd.to_numeric(df["close"], errors="coerce")
+    df = df.copy()
+    prev_close = df["close"].shift(1)
 
-    prev_close = close.shift(1)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - prev_close).abs()
+    tr3 = (df["low"] - prev_close).abs()
 
-    tr1 = high - low
-    tr2 = (high - prev_close).abs()
-    tr3 = (low - prev_close).abs()
-
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    df["atr"] = true_range.rolling(window=period, min_periods=period).mean()
-
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(period).mean()
     return df
 
 
 def add_momentum_pullback_signals(
     df: pd.DataFrame,
-    mom_lookback: int = 63,
-    trend_short: int = 50,
-    trend_long: int = 200,
-    pullback_lookback: int = 10,
-    min_momentum: float = 0.15,   # +15% over lookback
-    min_pullback: float = 0.03,   # 3% off recent high
-    max_pullback: float = 0.12,   # 12% off recent high
+    ma_fast: int = 20,
+    ma_slow: int = 50,
 ) -> pd.DataFrame:
     """
-    Build a momentum + pullback long-only signal.
-
-    Conditions for signal = 1 (long regime):
-
-      1) Uptrend:
-           - 50-day SMA > 200-day SMA
-           - Close > 50-day SMA
-
-      2) Strong momentum:
-           - (Close / Close_n_days_ago - 1) >= +15%
-
-      3) Pullback:
-           - Price is 3% to 12% below the max close of the last 10 days
-
-      4) Turning up:
-           - Today's close > yesterday's close
+    Very simple momentum/pullback signal:
+    - Compute MA_fast and MA_slow
+    - Signal is 1 when:
+        close > MA_slow AND MA_fast > MA_slow
+      else 0
+    Adds columns: ma_fast, ma_slow, signal
     """
-    close = pd.to_numeric(df["close"], errors="coerce")
+    df = df.copy()
+    df["ma_fast"] = df["close"].rolling(ma_fast).mean()
+    df["ma_slow"] = df["close"].rolling(ma_slow).mean()
 
-    # Trend filters
-    df["ma_trend_short"] = close.rolling(
-        window=trend_short, min_periods=trend_short
-    ).mean()
-    df["ma_trend_long"] = close.rolling(
-        window=trend_long, min_periods=trend_long
-    ).mean()
-
-    # Momentum: ~3-month lookback
-    df["momentum"] = close / close.shift(mom_lookback) - 1.0
-
-    # Pullback from recent high
-    recent_max = close.rolling(
-        window=pullback_lookback,
-        min_periods=pullback_lookback
-    ).max()
-
-    pullback_pct = (recent_max - close) / recent_max
-    pullback_pct = pullback_pct.fillna(0.0)
-    df["pullback_pct"] = pullback_pct
-
-    # Initialize signal to 0
     df["signal"] = 0
-
-    # Turning-up condition: today's close > yesterday's close
-    close_yesterday = close.shift(1)
-
-    long_condition = (
-        (df["ma_trend_short"] > df["ma_trend_long"]) &    # uptrend
-        (close > df["ma_trend_short"]) &                  # price above 50-day
-        (df["momentum"] >= min_momentum) &                # strong momentum
-        (df["pullback_pct"] >= min_pullback) &
-        (df["pullback_pct"] <= max_pullback) &            # 3%–12% pullback
-        (close > close_yesterday)                         # price turning up
-    )
-
-    df.loc[long_condition, "signal"] = 1
+    cond = (df["close"] > df["ma_slow"]) & (df["ma_fast"] > df["ma_slow"])
+    df.loc[cond, "signal"] = 1
 
     return df
 
 
 # ------------------------------------------------------------
-# 2. BACKTEST ENGINE USING THE RISK MODULE
+# 2. BACKTEST CORE
 # ------------------------------------------------------------
 
 def run_backtest(
@@ -156,38 +155,23 @@ def run_backtest(
     trail_atr_multiple: float | None = None,
 ) -> tuple[pd.DataFrame, float]:
     """
-    Run a simple long-only backtest:
-
-      - Uses 'signal' column (1 = long regime, 0 = flat)
-      - Enters when signal goes 0 -> 1
-      - Exits on:
-          * stop hit (with optional ATR trailing)
-          * target hit
-          * signal goes 1 -> 0
-          * max_hold_days reached
-
-      - Position size, stop, and target are all computed by calculate_risk_for_trade.
-
-      - If trail_atr_multiple is not None, a trailing stop is applied:
-          * Each bar, stop_price is raised to (close - trail_atr_multiple * ATR)
-            if that is higher than the current stop_price.
-          * The stop never moves down.
+    Long-only backtest:
+      - signal 0->1 enters
+      - exits on stop, target, signal 1->0, or time stop
+    Returns: (trades_df, final_equity)
     """
     df = df.reset_index(drop=True).copy()
 
-    equity = initial_equity
+    equity = float(initial_equity)
     in_position = False
     entry_index: int | None = None
     current_trade: dict | None = None
-
     trades: list[dict] = []
 
-    # Start at 1 so we can always look back at i-1
     for i in range(1, len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
 
-        # Ensure numeric types
         high = float(row["high"])
         low = float(row["low"])
         close = float(row["close"])
@@ -195,12 +179,11 @@ def run_backtest(
         prev_signal = int(prev_row["signal"])
 
         if not in_position:
-            # ENTRY: signal turns from 0 -> 1
             if prev_signal == 0 and signal == 1:
-                entry_price = close
+                entry_price = close * (1.0 + SLIPPAGE_PCT)
                 atr = float(row["atr"])
 
-                # Compute risk + position size for this trade
+                # IMPORTANT: risk.py expects 'account_equity'
                 risk_info = calculate_risk_for_trade(
                     entry_price=entry_price,
                     atr=atr,
@@ -210,7 +193,6 @@ def run_backtest(
 
                 shares = int(risk_info["shares"])
                 if shares <= 0:
-                    # Skip trades where even 1 share would violate risk rules
                     continue
 
                 stop_price = float(risk_info["stop_price"])
@@ -218,12 +200,11 @@ def run_backtest(
 
                 in_position = True
                 entry_index = i
-
                 current_trade = {
                     "entry_date": row["date"],
                     "entry_price": entry_price,
-                    "stop_price": stop_price,             # dynamic stop (may trail)
-                    "initial_stop_price": stop_price,     # fixed for R calculation
+                    "stop_price": stop_price,
+                    "initial_stop_price": stop_price,
                     "target_price": target_price,
                     "shares": shares,
                     "allowed_dollar_risk": float(risk_info["allowed_dollar_risk"]),
@@ -231,47 +212,39 @@ def run_backtest(
                 }
 
         else:
-            # We are IN a position: manage exits
             assert current_trade is not None
             assert entry_index is not None
 
             hold_days = i - entry_index
 
-            # ---------------- Trailing stop update (if enabled) ----------------
+            # Trailing stop update (if enabled)
             if trail_atr_multiple is not None:
                 atr_today = float(row.get("atr", 0.0))
                 if atr_today > 0.0:
                     trail_dist = trail_atr_multiple * atr_today
                     candidate_stop = close - trail_dist
-                    # For a long, stop can only move up
                     if candidate_stop > current_trade["stop_price"]:
                         current_trade["stop_price"] = candidate_stop
 
             exit_price: float | None = None
             exit_reason: str | None = None
 
-            # 1) Stop-loss: if today's low touches or breaks (possibly trailed) stop
             if low <= current_trade["stop_price"]:
                 exit_price = current_trade["stop_price"]
                 exit_reason = "stop"
-
-            # 2) Target: if today's high touches or exceeds target
             elif high >= current_trade["target_price"]:
                 exit_price = current_trade["target_price"]
                 exit_reason = "target"
-
-            # 3) Signal exit: trend turns off (1 -> 0)
             elif prev_signal == 1 and signal == 0:
                 exit_price = close
                 exit_reason = "signal_exit"
-
-            # 4) Time-based exit
             elif hold_days >= max_hold_days:
                 exit_price = close
                 exit_reason = "time_exit"
 
             if exit_price is not None:
-                # Compute R and P&L (R based on INITIAL stop, not trailed stop)
+                exit_price = float(exit_price) * (1.0 - SLIPPAGE_PCT)
+
                 R_value = calculate_R(
                     exit_price=exit_price,
                     entry_price=current_trade["entry_price"],
@@ -292,13 +265,11 @@ def run_backtest(
 
                 trades.append(current_trade)
 
-                # Reset position state
                 in_position = False
                 entry_index = None
                 current_trade = None
 
-    trades_df = pd.DataFrame(trades)
-    return trades_df, equity
+    return pd.DataFrame(trades), equity
 
 
 # ------------------------------------------------------------
@@ -306,47 +277,36 @@ def run_backtest(
 # ------------------------------------------------------------
 
 def print_summary(trades_df: pd.DataFrame, initial_equity: float, final_equity: float) -> None:
-    print("\n===== BACKTEST SUMMARY =====")
-
     if trades_df.empty:
-        print("No trades were taken.")
-        print(f"Final equity: {final_equity:,.2f} (initial: {initial_equity:,.2f})")
+        print("\n===== BACKTEST SUMMARY =====")
+        print("No trades generated.")
         return
 
     n_trades = len(trades_df)
-    wins = trades_df[trades_df["pnl_dollars"] > 0]
-    losses = trades_df[trades_df["pnl_dollars"] <= 0]
-
-    win_rate = len(wins) / n_trades * 100.0
+    win_rate = (trades_df["pnl_dollars"] > 0).mean() * 100.0
     avg_R = trades_df["R"].mean()
     total_R = trades_df["R"].sum()
 
-    # Equity curve (include starting equity)
     equity_series = pd.concat(
         [pd.Series([initial_equity]), trades_df["equity_after"]],
         ignore_index=True,
     )
-
     rolling_max = equity_series.cummax()
     drawdown = equity_series - rolling_max
     max_drawdown = drawdown.min()
 
+    print("\n===== BACKTEST SUMMARY =====")
     print(f"Number of trades      : {n_trades}")
     print(f"Win rate              : {win_rate:.2f}%")
     print(f"Average R per trade   : {avg_R:.2f}R")
     print(f"Total R               : {total_R:.2f}R")
     print(f"Initial equity        : {initial_equity:,.2f}")
     print(f"Final equity          : {final_equity:,.2f}")
-    print(f"Net P&L               : {final_equity - initial_equity:,.2f}")
+    print(f"Net P&L               : {(final_equity - initial_equity):,.2f}")
     print(f"Max drawdown          : {max_drawdown:,.2f}")
 
 
 def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
-    """
-    Extra analysis across all symbols:
-      - Per-symbol performance (R, win rate, drawdown)
-      - R-distribution buckets
-    """
     if combined_trades.empty:
         print("\nNo trades to analyze.")
         return
@@ -357,17 +317,11 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
     for symbol, g in grouped:
         n_trades = len(g)
         wins = g[g["pnl_dollars"] > 0]
-        losses = g[g["pnl_dollars"] <= 0]
+        win_rate = (len(wins) / n_trades) * 100.0 if n_trades > 0 else 0.0
+        avg_R = float(g["R"].mean()) if n_trades > 0 else 0.0
+        total_R = float(g["R"].sum()) if n_trades > 0 else 0.0
 
-        win_rate = len(wins) / n_trades * 100.0 if n_trades > 0 else 0.0
-        avg_R = g["R"].mean()
-        total_R = g["R"].sum()
-
-        # Reconstruct a simple equity curve per symbol
-        if "account_equity_at_entry" in g.columns:
-            start_equity = float(g["account_equity_at_entry"].iloc[0])
-        else:
-            start_equity = 100_000.0  # fallback
+        start_equity = float(g["account_equity_at_entry"].iloc[0]) if "account_equity_at_entry" in g.columns else 100_000.0
 
         equity_series = pd.concat(
             [pd.Series([start_equity]), g["equity_after"]],
@@ -377,24 +331,24 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
         drawdown = equity_series - rolling_max
         max_drawdown = drawdown.min()
 
+        end_equity = float(g["equity_after"].iloc[-1]) if n_trades > 0 else start_equity
+
         print(f"\nSymbol              : {symbol}")
         print(f"  Trades            : {n_trades}")
         print(f"  Win rate          : {win_rate:.2f}%")
         print(f"  Avg R per trade   : {avg_R:.2f}R")
         print(f"  Total R           : {total_R:.2f}R")
         print(f"  Start equity      : {start_equity:,.2f}")
-        print(f"  End equity        : {float(g['equity_after'].iloc[-1]):,.2f}")
+        print(f"  End equity        : {end_equity:,.2f}")
         print(f"  Max drawdown      : {max_drawdown:,.2f}")
 
-    # ---- Global R-distribution across all symbols ----
     print("\n\n===== GLOBAL R DISTRIBUTION (ALL SYMBOLS) =====")
-
     R_values = combined_trades["R"].dropna()
     if R_values.empty:
-        print("No R values available.")
+        print("No R values found.")
         return
 
-    bins = [-10.0, -1.0, 0.0, 1.0, 2.0, 10.0]
+    bins = [-float("inf"), -1.0, 0.0, 1.0, 2.0, float("inf")]
     labels = ["< -1R", "-1R to 0R", "0R to 1R", "1R to 2R", "> 2R"]
 
     R_binned = pd.cut(R_values, bins=bins, labels=labels, include_lowest=True)
@@ -411,36 +365,74 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
 # 4. PER-SYMBOL BACKTEST HELPER
 # ------------------------------------------------------------
 
+def _resolve_data_dir(
+    data_dir: Path | None,
+    project_root: Path | None,
+) -> Path:
+    """
+    Resolve the directory containing CSVs like: {symbol}_daily.csv
+
+    Priority:
+      1) explicit data_dir
+      2) project_root/data
+      3) project_root/project_purple/data
+      4) backtest_v2.py sibling ./data
+    """
+    if data_dir is not None:
+        return Path(data_dir)
+
+    if project_root is not None:
+        pr = Path(project_root)
+        cand1 = pr / "data"
+        if cand1.exists():
+            return cand1
+        cand2 = pr / "project_purple" / "data"
+        if cand2.exists():
+            return cand2
+
+    return Path(__file__).resolve().parent / "data"
+
+
 def run_backtest_for_symbol(
     symbol: str,
-    project_root: Path,
-    risk_config: RiskConfig,
-    initial_equity: float,
-    max_hold_days: int,
-    trail_atr_multiple: float | None,
+    data_dir: Path | None = None,
+    risk_config: RiskConfig | None = None,
+    initial_equity: float = 100_000.0,
+    max_hold_days: int = 10,
+    trail_atr_multiple: float | None = None,
+    project_root: Path | None = None,   # accepts project_root from your main.py
 ) -> tuple[pd.DataFrame, float]:
     """
-    Load data for one symbol, build indicators/signals, run backtest,
-    print trades + summary, and return the trades + final equity.
+    Load data for a given symbol from CSV, compute indicators, generate signals,
+    and run backtest.
+
+    IMPORTANT: Returns a 2-tuple (trades_df, final_equity) to match main.py unpacking.
     """
-    data_path = project_root / "project_purple" / "data" / f"{symbol}_daily.csv"
-    print(f"\nLoading data for {symbol} from: {data_path}")
+    if risk_config is None:
+        risk_config = RiskConfig()
 
-    if not data_path.exists():
-        raise FileNotFoundError(f"Could not find data file for {symbol} at: {data_path}")
+    resolved_data_dir = _resolve_data_dir(data_dir=data_dir, project_root=project_root)
+    csv_path = resolved_data_dir / f"{symbol}_daily.csv"
 
-    df_raw = pd.read_csv(data_path)
-    print("Raw columns:", list(df_raw.columns))
+    if not csv_path.exists():
+        print(f"Data file not found for {symbol}: {csv_path}")
+        return pd.DataFrame(), float(initial_equity)
 
-    df = clean_aapl_dataframe(df_raw)
-    print("Cleaned columns:", list(df.columns))
+    print(f"\nLoading data for {symbol} from: {csv_path}")
 
-    df = add_atr(df)
-    df = add_momentum_pullback_signals(df)
+    df = pd.read_csv(csv_path)
+    print(f"Raw columns: {list(df.columns)}")
 
-    df = df.dropna(
-        subset=["atr", "ma_trend_short", "ma_trend_long", "momentum", "pullback_pct"]
-    ).reset_index(drop=True)
+    df = clean_aapl_dataframe(df)
+    print(f"Cleaned columns: {list(df.columns)}")
+
+    df = add_atr(df, period=14)
+    df = add_momentum_pullback_signals(df, ma_fast=20, ma_slow=50)
+
+    df = df.dropna(subset=["atr", "ma_fast", "ma_slow"]).reset_index(drop=True)
+    if df.empty:
+        print("No usable rows after indicators (likely too little data).")
+        return pd.DataFrame(), float(initial_equity)
 
     trades_df, final_equity = run_backtest(
         df=df,
@@ -452,65 +444,31 @@ def run_backtest_for_symbol(
 
     if not trades_df.empty:
         trades_df["symbol"] = symbol
-        print(f"\n===== FIRST 10 TRADES FOR {symbol} =====")
-        print(trades_df.head(10))
-    else:
-        print(f"\nNo trades were generated by the strategy for {symbol}.")
 
-    print_summary(trades_df, initial_equity, final_equity)
+    print_summary(trades_df, initial_equity=initial_equity, final_equity=final_equity)
 
     return trades_df, final_equity
 
 
-# ------------------------------------------------------------
-# 5. MAIN ENTRY POINT
-# ------------------------------------------------------------
+def main() -> None:
+    """
+    Optional: run this file directly for quick testing.
+    Universe runs happen in project_purple/main.py via run_project_purple.py
+    """
+    data_dir = Path(__file__).resolve().parent / "data"
+    risk_config = RiskConfig()
 
-def main():
-    project_root = Path(__file__).resolve().parents[1]
-
-    risk_config = RiskConfig(
-        risk_per_trade_pct=0.01,         # risk 1% of account per trade
-        atr_stop_multiple=1.5,           # stop 1.5 ATR below entry
-        atr_target_multiple=3.0,         # target 3 ATR above entry
-        max_position_pct_of_equity=0.20, # max 20% of equity in a single stock
-        min_shares=1,
+    sym = "AAPL"
+    trades_df, final_equity = run_backtest_for_symbol(
+        symbol=sym,
+        data_dir=data_dir,
+        risk_config=risk_config,
+        initial_equity=100_000.0,
+        max_hold_days=10,
+        trail_atr_multiple=None,
     )
-
-    initial_equity = 100_000.0
-    max_hold_days = 10
-
-    # Optional ATR trailing stop.
-    # Set to None to disable trailing and use only fixed stop/target.
-    trail_atr_multiple: float | None = 3.0
-
-    # Add or remove symbols here as you like
-    symbols = ["AAPL", "NVDA", "SPY", "TSLA", "AMD", "MSFT", "META"]
-
-    all_trades: list[pd.DataFrame] = []
-
-    for symbol in symbols:
-        print(f"\n\n========== RUNNING BACKTEST FOR {symbol} ==========")
-        trades_df, final_equity = run_backtest_for_symbol(
-            symbol=symbol,
-            project_root=project_root,
-            risk_config=risk_config,
-            initial_equity=initial_equity,
-            max_hold_days=max_hold_days,
-            trail_atr_multiple=trail_atr_multiple,
-        )
-        if not trades_df.empty:
-            all_trades.append(trades_df)
-
-    if all_trades:
-        combined_trades = pd.concat(all_trades, ignore_index=True)
-        print("\n\n===== COMBINED TRADES (ALL SYMBOLS) – FIRST 10 ROWS =====")
-        print(combined_trades.head(10))
-
-        # Deep dive analysis across all symbols
-        analyze_combined_trades(combined_trades)
-    else:
-        print("\nNo trades were generated for any symbol.")
+    _ = trades_df
+    _ = final_equity
 
 
 if __name__ == "__main__":
