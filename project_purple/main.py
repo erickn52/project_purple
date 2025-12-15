@@ -13,12 +13,67 @@ from backtest_v2 import (
 )
 from market_state import get_market_state
 
-
 # Console colors for pretty printing
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
 RESET = "\033[0m"
+
+
+def apply_portfolio_policy_A(combined_trades):
+    """
+    Policy A (start simple):
+      - At most 1 open trade at a time (global).
+      - If multiple trades share the same entry_date, take the one with the best entry_score.
+      - Trades are executed sequentially: next trade starts only after current trade exits.
+
+    Requirements:
+      combined_trades must include:
+        - entry_date, exit_date, symbol
+        - entry_score (recommended; if missing, falls back to 0)
+    """
+    import pandas as pd
+
+    if combined_trades.empty:
+        return combined_trades
+
+    df = combined_trades.copy()
+
+    # Ensure datetime
+    df["entry_date"] = pd.to_datetime(df["entry_date"])
+    df["exit_date"] = pd.to_datetime(df["exit_date"])
+
+    # Entry score safety
+    if "entry_score" not in df.columns:
+        df["entry_score"] = 0.0
+
+    # Sort by entry_date first, then best score first (descending)
+    df = df.sort_values(by=["entry_date", "entry_score"], ascending=[True, False]).reset_index(drop=True)
+
+    # If multiple trades start the same day, keep only the best-scoring one
+    # (still may not be selected if another trade is already open)
+    df_best_per_day = (
+        df.sort_values(["entry_date", "entry_score"], ascending=[True, False])
+          .groupby("entry_date", as_index=False)
+          .head(1)
+          .reset_index(drop=True)
+    )
+
+    selected = []
+    current_exit = None
+
+    # Sequentially accept trades only when no trade is open
+    for _, tr in df_best_per_day.iterrows():
+        if current_exit is None:
+            selected.append(tr)
+            current_exit = tr["exit_date"]
+        else:
+            # accept only if this trade starts AFTER the last one ended
+            if tr["entry_date"] > current_exit:
+                selected.append(tr)
+                current_exit = tr["exit_date"]
+
+    return pd.DataFrame(selected)
 
 
 def main() -> None:
@@ -34,6 +89,7 @@ def main() -> None:
           * Run the ATR/R-based backtest engine with optional trailing stop
           * Print per-symbol summary
       - Combine all trades and print portfolio-level stats and R-distribution.
+      - Apply portfolio Policy A to simulate a “1-at-a-time” portfolio.
     """
 
     # --------------------------------------------------------
@@ -74,7 +130,6 @@ def main() -> None:
         else:
             regime_str = f"{YELLOW}{market_state.regime}{RESET}"
 
-        # Trade long: green if True, red if False
         trade_long_str = (
             f"{GREEN}True{RESET}"
             if market_state.trade_long
@@ -95,10 +150,6 @@ def main() -> None:
         print(f"Reason: {e}")
         market_state = None
 
-    # (Note: we no longer use a separate 'no_trade' flag here.
-    #  Trade-long behavior is described by market_state.trade_long
-    #  and can be wired into live trading later.)
-
     # --------------------------------------------------------
     # 3. Build trading universe
     # --------------------------------------------------------
@@ -109,8 +160,6 @@ def main() -> None:
         print("\nNo symbols passed the scanner filters. Nothing to backtest.")
         return
 
-    # If you want to limit the number of symbols for speed, slice here.
-    # Example: universe = universe[:10]
     print(f"\nUniverse size: {len(universe)}")
     print(f"Symbols      : {universe}")
 
@@ -122,7 +171,7 @@ def main() -> None:
     for symbol in universe:
         print(f"\n\n========== RUNNING BACKTEST FOR {symbol} ==========")
         try:
-            trades_df, final_equity = run_backtest_for_symbol(
+            trades_df, _final_equity = run_backtest_for_symbol(
                 symbol=symbol,
                 project_root=project_root,
                 risk_config=risk_config,
@@ -131,11 +180,9 @@ def main() -> None:
                 trail_atr_multiple=trail_atr_multiple,
             )
         except FileNotFoundError as e:
-            # Data not downloaded yet for this symbol
             print(f"SKIPPING {symbol}: {e}")
             continue
         except Exception as e:
-            # Any other unexpected error
             print(f"ERROR while backtesting {symbol}: {e}")
             continue
 
@@ -145,16 +192,34 @@ def main() -> None:
     # --------------------------------------------------------
     # 5. Combined portfolio-level analysis
     # --------------------------------------------------------
-    if all_trades:
-        import pandas as pd
-
-        combined_trades = pd.concat(all_trades, ignore_index=True)
-        print("\n\n===== COMBINED TRADES (ALL SYMBOLS) – FIRST 10 ROWS =====")
-        print(combined_trades.head(10))
-
-        analyze_combined_trades(combined_trades)
-    else:
+    if not all_trades:
         print("\nNo trades were generated for any symbol in the universe.")
+        return
+
+    import pandas as pd
+
+    combined_trades = pd.concat(all_trades, ignore_index=True)
+
+    print("\n\n===== COMBINED TRADES (ALL SYMBOLS) – FIRST 10 ROWS =====")
+    print(combined_trades.head(10))
+
+    # Full combined stats (includes overlapping trades across symbols)
+    analyze_combined_trades(combined_trades)
+
+    # --------------------------------------------------------
+    # 6. Apply Portfolio Policy A (1 trade at a time)
+    # --------------------------------------------------------
+    policy_trades = apply_portfolio_policy_A(combined_trades)
+
+    print("\n\n===== PORTFOLIO POLICY A (1-TRADE-AT-A-TIME) – FIRST 10 ROWS =====")
+    if policy_trades.empty:
+        print("No trades selected under Policy A.")
+        return
+
+    print(policy_trades.head(10))
+
+    print("\n\n===== POLICY A SUMMARY =====")
+    analyze_combined_trades(policy_trades)
 
 
 if __name__ == "__main__":
