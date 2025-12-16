@@ -46,23 +46,19 @@ def apply_portfolio_policy_A(combined_trades):
     # Entry score safety
     if "entry_score" not in df.columns:
         df["entry_score"] = 0.0
+    df["entry_score"] = df["entry_score"].fillna(0.0)
 
-    # Sort by entry_date first, then best score first (descending)
-    df = df.sort_values(by=["entry_date", "entry_score"], ascending=[True, False]).reset_index(drop=True)
-
-    # If multiple trades start the same day, keep only the best-scoring one
-    # (still may not be selected if another trade is already open)
+    # Best trade per day (by entry_score)
     df_best_per_day = (
         df.sort_values(["entry_date", "entry_score"], ascending=[True, False])
-          .groupby("entry_date", as_index=False)
-          .head(1)
-          .reset_index(drop=True)
+        .groupby("entry_date", as_index=False)
+        .first()
     )
 
+    # Enforce one trade at a time
     selected = []
     current_exit = None
 
-    # Sequentially accept trades only when no trade is open
     for _, tr in df_best_per_day.iterrows():
         if current_exit is None:
             selected.append(tr)
@@ -145,10 +141,29 @@ def main() -> None:
             print(f"ATR(14)    : {market_state.atr:.2f}")
         else:
             print("ATR(14)    : N/A")
+
+        # Apply regime-based risk multiplier (BULL=1.0, CHOPPY=0.5, BEAR=0.0)
+        # Scanner already enforces stricter selection in CHOPPY and returns an empty universe in BEAR.
+        if market_state.regime == "BULL":
+            regime_risk_mult = 1.0
+        elif market_state.regime == "CHOPPY":
+            regime_risk_mult = 0.5
+        elif market_state.regime == "BEAR":
+            regime_risk_mult = 0.0
+        else:
+            regime_risk_mult = 1.0
+
+        base_risk_pct = float(risk_config.risk_per_trade_pct)
+        risk_config.risk_per_trade_pct = base_risk_pct * regime_risk_mult
+
+        print(f"Risk mult  : {regime_risk_mult:.2f}x")
+        print(f"Risk/trade : {risk_config.risk_per_trade_pct:.3%} (base {base_risk_pct:.3%})")
     except Exception as e:
         print("\nWARNING: Could not determine market regime from SPY.")
         print(f"Reason: {e}")
         market_state = None
+        print("Risk mult  : N/A")
+        print(f"Risk/trade : {risk_config.risk_per_trade_pct:.3%} (base, regime unknown)")
 
     # --------------------------------------------------------
     # 3. Build trading universe
@@ -179,35 +194,42 @@ def main() -> None:
                 max_hold_days=max_hold_days,
                 trail_atr_multiple=trail_atr_multiple,
             )
-        except FileNotFoundError as e:
-            print(f"SKIPPING {symbol}: {e}")
-            continue
-        except Exception as e:
-            print(f"ERROR while backtesting {symbol}: {e}")
-            continue
 
-        if not trades_df.empty:
+            if trades_df.empty:
+                print(f"No trades for {symbol}.")
+                continue
+
+            # Attach symbol column if needed
+            if "symbol" not in trades_df.columns:
+                trades_df["symbol"] = symbol
+
             all_trades.append(trades_df)
 
-    # --------------------------------------------------------
-    # 5. Combined portfolio-level analysis
-    # --------------------------------------------------------
+            # Print summary (first few rows)
+            print(trades_df.head(10))
+
+        except Exception as e:
+            print(f"ERROR: Backtest failed for {symbol}: {e}")
+
     if not all_trades:
-        print("\nNo trades were generated for any symbol in the universe.")
+        print("\nNo trades produced across the universe.")
         return
 
+    # --------------------------------------------------------
+    # 5. Combine trades and analyze portfolio-wide performance
+    # --------------------------------------------------------
     import pandas as pd
 
     combined_trades = pd.concat(all_trades, ignore_index=True)
 
-    print("\n\n===== COMBINED TRADES (ALL SYMBOLS) – FIRST 10 ROWS =====")
-    print(combined_trades.head(10))
+    print("\n\n===== COMBINED TRADES (ALL SYMBOLS) =====")
+    print(combined_trades.head(20))
 
-    # Full combined stats (includes overlapping trades across symbols)
+    print("\n\n===== COMBINED PORTFOLIO SUMMARY =====")
     analyze_combined_trades(combined_trades)
 
     # --------------------------------------------------------
-    # 6. Apply Portfolio Policy A (1 trade at a time)
+    # 6. Policy A: One trade at a time
     # --------------------------------------------------------
     policy_trades = apply_portfolio_policy_A(combined_trades)
 
