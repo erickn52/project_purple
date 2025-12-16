@@ -13,6 +13,16 @@ REGIME_ATR_WINDOW = 14
 
 MARKET_SYMBOL = "SPY"  # we can parameterize later if needed
 
+# Risk multipliers by regime (applies to base risk_per_trade_pct in main.py)
+# - BULL: full risk
+# - CHOPPY: reduced risk (still allowed to trade long, but smaller)
+# - BEAR: no long trades (trade_long False); multiplier effectively 0
+RISK_MULTIPLIER_BY_REGIME = {
+    "BULL": 1.00,
+    "CHOPPY": 0.50,
+    "BEAR": 0.00,
+}
+
 # Console colors
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -46,6 +56,17 @@ class MarketState:
         Same meaning as trade_long.
         """
         return self.trade_long
+
+    @property
+    def risk_multiplier(self) -> float:
+        """
+        Multiplier applied to base risk per trade based on market regime.
+
+        Intended use (in main.py):
+            effective_risk_pct = base_risk_pct * state.risk_multiplier
+        """
+        # If a new/unknown regime ever appears, be conservative.
+        return float(RISK_MULTIPLIER_BY_REGIME.get(self.regime, 0.00))
 
 
 def _compute_atr(df: pd.DataFrame, window: int) -> pd.Series:
@@ -128,6 +149,7 @@ if __name__ == "__main__":
 
     print(f"\nRegime:         {regime_str}")
     print(f"Trade long:     {trade_long_str}")
+    print(f"Risk mult:      {state.risk_multiplier:.2f}x")
 
     print(f"\nClose:          {state.close:.2f}")
     print(f"50 MA:          {state.ma_fast:.2f}")
