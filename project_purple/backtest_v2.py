@@ -4,10 +4,86 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from risk import RiskConfig, calculate_risk_for_trade, calculate_R
+# Support running as:
+# - script from repo root: python project_purple/backtest_v2.py  (imports "risk")
+# - module import: python -c "import project_purple.backtest_v2" (imports "project_purple.risk")
+try:
+    from risk import RiskConfig, calculate_risk_for_trade, calculate_R
+except ModuleNotFoundError:  # pragma: no cover
+    from project_purple.risk import RiskConfig, calculate_risk_for_trade, calculate_R
 
 
 SLIPPAGE_PCT = 0.001
+
+
+# ------------------------------------------------------------
+# 0. STRICT DATA VALIDATION (Step 4)
+# ------------------------------------------------------------
+
+def validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
+    """
+    Strict OHLCV validation:
+    - dates must be sorted ascending and unique
+    - no missing OHLC values
+    - prices must be positive
+    - high >= low
+    - open/close must be within [low, high]
+    - volume must be non-negative (if present)
+    """
+    required = {"date", "open", "high", "low", "close"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"[{symbol}] Validation failed: missing columns {sorted(missing)}")
+
+    if df.empty:
+        raise ValueError(f"[{symbol}] Validation failed: dataframe is empty")
+
+    if df["date"].isna().any():
+        raise ValueError(f"[{symbol}] Validation failed: date contains NaT/NaN")
+
+    # sorted + unique dates
+    if not df["date"].is_monotonic_increasing:
+        raise ValueError(f"[{symbol}] Validation failed: dates not sorted ascending")
+
+    dupes = df["date"].duplicated()
+    if dupes.any():
+        examples = df.loc[dupes, ["date"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: duplicate dates (examples: {examples})")
+
+    # numeric + finite + positive
+    for c in ["open", "high", "low", "close"]:
+        if df[c].isna().any():
+            raise ValueError(f"[{symbol}] Validation failed: {c} has NaN")
+        if not np.isfinite(df[c]).all():
+            raise ValueError(f"[{symbol}] Validation failed: {c} has non-finite values")
+        if (df[c] <= 0).any():
+            bad = df.loc[df[c] <= 0, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+            raise ValueError(f"[{symbol}] Validation failed: {c} <= 0 (examples: {bad})")
+
+    # OHLC relationships
+    bad_hl = df["high"] < df["low"]
+    if bad_hl.any():
+        bad = df.loc[bad_hl, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: high < low (examples: {bad})")
+
+    bad_open = (df["open"] < df["low"]) | (df["open"] > df["high"])
+    if bad_open.any():
+        bad = df.loc[bad_open, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: open outside [low, high] (examples: {bad})")
+
+    bad_close = (df["close"] < df["low"]) | (df["close"] > df["high"])
+    if bad_close.any():
+        bad = df.loc[bad_close, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: close outside [low, high] (examples: {bad})")
+
+    # volume (if present)
+    if "volume" in df.columns:
+        vol = pd.to_numeric(df["volume"], errors="coerce")
+        if vol.isna().any():
+            raise ValueError(f"[{symbol}] Validation failed: volume has NaN/non-numeric")
+        if (vol < 0).any():
+            bad = df.loc[vol < 0, ["date", "volume"]].head(10).to_dict(orient="records")
+            raise ValueError(f"[{symbol}] Validation failed: volume < 0 (examples: {bad})")
 
 
 # ------------------------------------------------------------
@@ -125,14 +201,12 @@ def run_backtest(
 ) -> tuple[pd.DataFrame, float]:
     """
     Fill realism (EOD system):
-
-    - Signals are computed using each day's close (already in df["signal"]).
-    - When a 0→1 signal transition occurs at day i close, entry is executed at day i+1 open.
-    - Stops/targets are intraday (use high/low of the day).
-    - Discretionary exits (signal/time) are decided at the close and executed at next open.
+    - Signals computed on close.
+    - If signal flips 0→1 on day i close, entry executes on day i+1 open.
+    - Stops/targets are intraday (gap at open handled explicitly).
+    - Discretionary exits (signal/time) are decided on the close and execute next open.
     """
     df = df.reset_index(drop=True).copy()
-
     equity = float(initial_equity)
 
     in_position = False
@@ -140,9 +214,8 @@ def run_backtest(
     current_trade: dict | None = None
     trades: list[dict] = []
 
-    # Pending decisions (EOD decisions executed next open)
     pending_entry: dict | None = None
-    pending_exit_reason: str | None = None  # when set, exit next open (unless stop/target triggers first)
+    pending_exit_reason: str | None = None  # exit at next open, unless stop/target triggers first
 
     n = len(df)
 
@@ -158,11 +231,8 @@ def run_backtest(
         signal = int(row["signal"])
         prev_signal = int(prev_row["signal"])
 
-        # ----------------------------------------------------
-        # 2A) Execute pending ENTRY at today's open (if any)
-        # ----------------------------------------------------
+        # 2A) Execute pending entry at today's open
         if (not in_position) and (pending_entry is not None):
-            # Execute entry at today's open with slippage
             entry_price = open_ * (1.0 + SLIPPAGE_PCT)
 
             atr = float(pending_entry["atr"])
@@ -187,49 +257,37 @@ def run_backtest(
                 in_position = True
                 entry_index = i
                 current_trade = {
-                    # Decision context (EOD)
                     "signal_date": decision_date,
                     "signal_close": decision_close,
-
-                    # Execution context (next open)
                     "entry_date": row["date"],
                     "entry_open": open_,
                     "entry_price": entry_price,
-
                     "stop_price": stop_price,
                     "initial_stop_price": stop_price,
                     "target_price": target_price,
                     "shares": shares,
                     "allowed_dollar_risk": float(risk_info["allowed_dollar_risk"]),
                     "account_equity_at_entry": equity,
-
-                    # ranking/debug
                     "entry_score": entry_score,
                     "entry_atr": atr,
                     "entry_ma_fast": ma_fast,
                     "entry_ma_slow": ma_slow,
                 }
 
-            # Clear pending entry regardless (either filled or skipped)
             pending_entry = None
 
-        # ----------------------------------------------------
-        # 2B) If in position, evaluate exits for today
-        #      Priority: gap stop/target -> intraday stop/target -> scheduled open exit
-        # ----------------------------------------------------
+        # 2B) Exits (gap -> intraday -> scheduled exit at open)
         if in_position:
             assert current_trade is not None
             assert entry_index is not None
 
             hold_days = i - entry_index
+            stop_price = float(current_trade["stop_price"])
+            target_price = float(current_trade["target_price"])
 
             exit_price: float | None = None
             exit_reason: str | None = None
 
-            stop_price = float(current_trade["stop_price"])
-            target_price = float(current_trade["target_price"])
-
-            # Gap handling: if open gaps through stop/target, you get filled near open
             if open_ <= stop_price:
                 exit_price = open_
                 exit_reason = "stop_gap"
@@ -237,21 +295,17 @@ def run_backtest(
                 exit_price = open_
                 exit_reason = "target_gap"
             else:
-                # Intraday touches
                 if low <= stop_price:
                     exit_price = stop_price
                     exit_reason = "stop"
                 elif high >= target_price:
                     exit_price = target_price
                     exit_reason = "target"
-                else:
-                    # Scheduled discretionary exit at open (from prior day's close decision)
-                    if pending_exit_reason is not None:
-                        exit_price = open_
-                        exit_reason = pending_exit_reason
+                elif pending_exit_reason is not None:
+                    exit_price = open_
+                    exit_reason = pending_exit_reason
 
             if exit_price is not None:
-                # Apply exit slippage
                 exit_price = float(exit_price) * (1.0 - SLIPPAGE_PCT)
 
                 R_value = calculate_R(
@@ -272,41 +326,31 @@ def run_backtest(
                     "equity_after": equity,
                     "exit_reason": exit_reason,
                 })
-
                 trades.append(current_trade)
 
-                # Reset state
                 in_position = False
                 entry_index = None
                 current_trade = None
                 pending_exit_reason = None
 
             else:
-                # Not exiting today.
-
-                # Decide discretionary exits at the CLOSE, execute next OPEN.
-                # Only schedule if there *is* a next bar to execute on.
+                # schedule close-decided exits for next open
                 if i < (n - 1):
                     if (prev_signal == 1) and (signal == 0):
                         pending_exit_reason = "signal_exit"
                     elif hold_days >= max_hold_days:
                         pending_exit_reason = "time_exit"
 
-                # Trailing stop update should happen AFTER today's exit checks
-                # so we don't "raise a stop using today's close" and then trigger it with today's low/high.
+                # trailing stop AFTER exit checks
                 if (trail_atr_multiple is not None) and (current_trade is not None):
                     atr_today = float(row.get("atr", 0.0))
                     if atr_today > 0.0:
-                        trail_dist = trail_atr_multiple * atr_today
-                        candidate_stop = close - trail_dist
+                        candidate_stop = close - (trail_atr_multiple * atr_today)
                         if candidate_stop > float(current_trade["stop_price"]):
                             current_trade["stop_price"] = candidate_stop
 
-        # ----------------------------------------------------
-        # 2C) If flat, schedule entry at next open based on close signal (0→1)
-        # ----------------------------------------------------
+        # 2C) Schedule entry for next open
         if (not in_position) and (pending_entry is None):
-            # Schedule only if there's a next bar to enter on.
             if (prev_signal == 0) and (signal == 1) and (i < (n - 1)):
                 atr = float(row["atr"])
                 ma_fast = float(row.get("ma_fast", np.nan))
@@ -322,9 +366,7 @@ def run_backtest(
                     "entry_score": entry_score,
                 }
 
-    # --------------------------------------------------------
-    # 2D) Force close any open position at final close (backtest bookkeeping)
-    # --------------------------------------------------------
+    # 2D) Force close at final close (bookkeeping convenience)
     if in_position and (current_trade is not None):
         last_row = df.iloc[-1]
         final_close = float(last_row["close"])
@@ -348,7 +390,6 @@ def run_backtest(
             "equity_after": equity,
             "exit_reason": "forced_final_close",
         })
-
         trades.append(current_trade)
 
     return pd.DataFrame(trades), equity
@@ -362,6 +403,8 @@ def print_summary(trades_df: pd.DataFrame, initial_equity: float, final_equity: 
     print("\n===== BACKTEST SUMMARY =====")
     if trades_df.empty:
         print("No trades generated.")
+        print(f"Initial equity        : {initial_equity:,.2f}")
+        print(f"Final equity          : {final_equity:,.2f}")
         return
 
     n_trades = len(trades_df)
@@ -447,6 +490,13 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
 # ------------------------------------------------------------
 
 def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
+    """
+    Resolution order:
+    1) explicit data_dir argument
+    2) explicit project_root argument (project_root/data or project_root/project_purple/data)
+    3) inferred repo-root data: <repo_root>/data  (preferred)
+    4) fallback: <this_file_dir>/data  (project_purple/data)
+    """
     if data_dir is not None:
         return Path(data_dir)
 
@@ -458,6 +508,12 @@ def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
         cand2 = pr / "project_purple" / "data"
         if cand2.exists():
             return cand2
+
+    # Inferred repo root: repo_root/project_purple/backtest_v2.py -> repo_root = parents[1]
+    inferred_root = Path(__file__).resolve().parents[1]
+    cand_repo_data = inferred_root / "data"
+    if cand_repo_data.exists():
+        return cand_repo_data
 
     return Path(__file__).resolve().parent / "data"
 
@@ -483,16 +539,24 @@ def run_backtest_for_symbol(
 
     print(f"\nLoading data for {symbol} from: {csv_path}")
 
-    df = pd.read_csv(csv_path)
-    print(f"Raw columns: {list(df.columns)}")
+    try:
+        df = pd.read_csv(csv_path)
+        print(f"Raw columns: {list(df.columns)}")
 
-    df = clean_aapl_dataframe(df)
-    print(f"Cleaned columns: {list(df.columns)}")
+        df = clean_aapl_dataframe(df)
+        print(f"Cleaned columns: {list(df.columns)}")
+
+        # validate immediately after clean
+        validate_ohlcv_dataframe(df=df, symbol=symbol)
+
+    except Exception as e:
+        print(f"\n[DATA INVALID] Skipping {symbol}. Reason: {e}")
+        return pd.DataFrame(), float(initial_equity)
 
     df = add_atr(df, period=14)
     df = add_momentum_pullback_signals(df, ma_fast=20, ma_slow=50)
-
     df = df.dropna(subset=["atr", "ma_fast", "ma_slow"]).reset_index(drop=True)
+
     if df.empty:
         print("No usable rows after indicators (likely too little data).")
         return pd.DataFrame(), float(initial_equity)
@@ -509,22 +573,23 @@ def run_backtest_for_symbol(
         trades_df["symbol"] = symbol
 
     print_summary(trades_df, initial_equity=initial_equity, final_equity=final_equity)
+    print(f"\n[BACKTEST_V2 DONE] symbol={symbol} trades={len(trades_df)} final_equity={final_equity:,.2f}")
 
     return trades_df, final_equity
 
 
 def main() -> None:
-    data_dir = Path(__file__).resolve().parent / "data"
     risk_config = RiskConfig()
-
     sym = "AAPL"
+
     trades_df, final_equity = run_backtest_for_symbol(
         symbol=sym,
-        data_dir=data_dir,
+        data_dir=None,
         risk_config=risk_config,
         initial_equity=100_000.0,
         max_hold_days=10,
         trail_atr_multiple=None,
+        project_root=None,
     )
     _ = trades_df
     _ = final_equity
