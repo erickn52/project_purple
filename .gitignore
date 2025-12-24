@@ -43,3 +43,15 @@ models/
 *.cache
 *.tmp
 .DS_Store
+
+# Env files (do not commit secrets)
+.env
+.env.*
+
+# Virtual environments
+.venv/
+venv/
+
+# Env files (do not commit secrets)
+.env
+.env.*
