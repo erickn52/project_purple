@@ -55,3 +55,6 @@ venv/
 # Env files (do not commit secrets)
 .env
 .env.*
+
+# Generated market data (do not version)
+project_purple/data/*.csv
