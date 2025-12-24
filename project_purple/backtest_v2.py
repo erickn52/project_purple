@@ -123,52 +123,79 @@ def run_backtest(
     max_hold_days: int = 10,
     trail_atr_multiple: float | None = None,
 ) -> tuple[pd.DataFrame, float]:
+    """
+    Fill realism (EOD system):
+
+    - Signals are computed using each day's close (already in df["signal"]).
+    - When a 0→1 signal transition occurs at day i close, entry is executed at day i+1 open.
+    - Stops/targets are intraday (use high/low of the day).
+    - Discretionary exits (signal/time) are decided at the close and executed at next open.
+    """
     df = df.reset_index(drop=True).copy()
 
     equity = float(initial_equity)
+
     in_position = False
     entry_index: int | None = None
     current_trade: dict | None = None
     trades: list[dict] = []
 
-    for i in range(1, len(df)):
+    # Pending decisions (EOD decisions executed next open)
+    pending_entry: dict | None = None
+    pending_exit_reason: str | None = None  # when set, exit next open (unless stop/target triggers first)
+
+    n = len(df)
+
+    for i in range(1, n):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1]
 
+        open_ = float(row["open"])
         high = float(row["high"])
         low = float(row["low"])
         close = float(row["close"])
+
         signal = int(row["signal"])
         prev_signal = int(prev_row["signal"])
 
-        if not in_position:
-            if prev_signal == 0 and signal == 1:
-                entry_price = close * (1.0 + SLIPPAGE_PCT)
-                atr = float(row["atr"])
-                ma_fast = float(row.get("ma_fast", np.nan))
-                ma_slow = float(row.get("ma_slow", np.nan))
+        # ----------------------------------------------------
+        # 2A) Execute pending ENTRY at today's open (if any)
+        # ----------------------------------------------------
+        if (not in_position) and (pending_entry is not None):
+            # Execute entry at today's open with slippage
+            entry_price = open_ * (1.0 + SLIPPAGE_PCT)
 
-                risk_info = calculate_risk_for_trade(
-                    entry_price=entry_price,
-                    atr=atr,
-                    account_equity=equity,
-                    config=risk_config,
-                )
+            atr = float(pending_entry["atr"])
+            ma_fast = float(pending_entry["ma_fast"])
+            ma_slow = float(pending_entry["ma_slow"])
+            decision_date = pending_entry["decision_date"]
+            decision_close = float(pending_entry["decision_close"])
+            entry_score = float(pending_entry["entry_score"])
 
-                shares = int(risk_info["shares"])
-                if shares <= 0:
-                    continue
+            risk_info = calculate_risk_for_trade(
+                entry_price=entry_price,
+                atr=atr,
+                account_equity=equity,
+                config=risk_config,
+            )
 
+            shares = int(risk_info["shares"])
+            if shares > 0:
                 stop_price = float(risk_info["stop_price"])
                 target_price = float(risk_info["target_price"])
-
-                entry_score = _compute_entry_score(close=close, ma_fast=ma_fast, ma_slow=ma_slow, atr=atr)
 
                 in_position = True
                 entry_index = i
                 current_trade = {
+                    # Decision context (EOD)
+                    "signal_date": decision_date,
+                    "signal_close": decision_close,
+
+                    # Execution context (next open)
                     "entry_date": row["date"],
+                    "entry_open": open_,
                     "entry_price": entry_price,
+
                     "stop_price": stop_price,
                     "initial_stop_price": stop_price,
                     "target_price": target_price,
@@ -176,58 +203,69 @@ def run_backtest(
                     "allowed_dollar_risk": float(risk_info["allowed_dollar_risk"]),
                     "account_equity_at_entry": equity,
 
-                    # new: stored for portfolio tie-break + debugging
+                    # ranking/debug
                     "entry_score": entry_score,
-                    "entry_close": close,
                     "entry_atr": atr,
                     "entry_ma_fast": ma_fast,
                     "entry_ma_slow": ma_slow,
                 }
 
-        else:
+            # Clear pending entry regardless (either filled or skipped)
+            pending_entry = None
+
+        # ----------------------------------------------------
+        # 2B) If in position, evaluate exits for today
+        #      Priority: gap stop/target -> intraday stop/target -> scheduled open exit
+        # ----------------------------------------------------
+        if in_position:
             assert current_trade is not None
             assert entry_index is not None
 
             hold_days = i - entry_index
 
-            if trail_atr_multiple is not None:
-                atr_today = float(row.get("atr", 0.0))
-                if atr_today > 0.0:
-                    trail_dist = trail_atr_multiple * atr_today
-                    candidate_stop = close - trail_dist
-                    if candidate_stop > current_trade["stop_price"]:
-                        current_trade["stop_price"] = candidate_stop
-
             exit_price: float | None = None
             exit_reason: str | None = None
 
-            if low <= current_trade["stop_price"]:
-                exit_price = current_trade["stop_price"]
-                exit_reason = "stop"
-            elif high >= current_trade["target_price"]:
-                exit_price = current_trade["target_price"]
-                exit_reason = "target"
-            elif prev_signal == 1 and signal == 0:
-                exit_price = close
-                exit_reason = "signal_exit"
-            elif hold_days >= max_hold_days:
-                exit_price = close
-                exit_reason = "time_exit"
+            stop_price = float(current_trade["stop_price"])
+            target_price = float(current_trade["target_price"])
+
+            # Gap handling: if open gaps through stop/target, you get filled near open
+            if open_ <= stop_price:
+                exit_price = open_
+                exit_reason = "stop_gap"
+            elif open_ >= target_price:
+                exit_price = open_
+                exit_reason = "target_gap"
+            else:
+                # Intraday touches
+                if low <= stop_price:
+                    exit_price = stop_price
+                    exit_reason = "stop"
+                elif high >= target_price:
+                    exit_price = target_price
+                    exit_reason = "target"
+                else:
+                    # Scheduled discretionary exit at open (from prior day's close decision)
+                    if pending_exit_reason is not None:
+                        exit_price = open_
+                        exit_reason = pending_exit_reason
 
             if exit_price is not None:
+                # Apply exit slippage
                 exit_price = float(exit_price) * (1.0 - SLIPPAGE_PCT)
 
                 R_value = calculate_R(
                     exit_price=exit_price,
-                    entry_price=current_trade["entry_price"],
-                    stop_price=current_trade["initial_stop_price"],
+                    entry_price=float(current_trade["entry_price"]),
+                    stop_price=float(current_trade["initial_stop_price"]),
                 )
 
-                pnl_dollars = (exit_price - current_trade["entry_price"]) * current_trade["shares"]
+                pnl_dollars = (exit_price - float(current_trade["entry_price"])) * int(current_trade["shares"])
                 equity += pnl_dollars
 
                 current_trade.update({
                     "exit_date": row["date"],
+                    "exit_open": open_,
                     "exit_price": exit_price,
                     "R": R_value,
                     "pnl_dollars": pnl_dollars,
@@ -237,9 +275,81 @@ def run_backtest(
 
                 trades.append(current_trade)
 
+                # Reset state
                 in_position = False
                 entry_index = None
                 current_trade = None
+                pending_exit_reason = None
+
+            else:
+                # Not exiting today.
+
+                # Decide discretionary exits at the CLOSE, execute next OPEN.
+                # Only schedule if there *is* a next bar to execute on.
+                if i < (n - 1):
+                    if (prev_signal == 1) and (signal == 0):
+                        pending_exit_reason = "signal_exit"
+                    elif hold_days >= max_hold_days:
+                        pending_exit_reason = "time_exit"
+
+                # Trailing stop update should happen AFTER today's exit checks
+                # so we don't "raise a stop using today's close" and then trigger it with today's low/high.
+                if (trail_atr_multiple is not None) and (current_trade is not None):
+                    atr_today = float(row.get("atr", 0.0))
+                    if atr_today > 0.0:
+                        trail_dist = trail_atr_multiple * atr_today
+                        candidate_stop = close - trail_dist
+                        if candidate_stop > float(current_trade["stop_price"]):
+                            current_trade["stop_price"] = candidate_stop
+
+        # ----------------------------------------------------
+        # 2C) If flat, schedule entry at next open based on close signal (0→1)
+        # ----------------------------------------------------
+        if (not in_position) and (pending_entry is None):
+            # Schedule only if there's a next bar to enter on.
+            if (prev_signal == 0) and (signal == 1) and (i < (n - 1)):
+                atr = float(row["atr"])
+                ma_fast = float(row.get("ma_fast", np.nan))
+                ma_slow = float(row.get("ma_slow", np.nan))
+                entry_score = _compute_entry_score(close=close, ma_fast=ma_fast, ma_slow=ma_slow, atr=atr)
+
+                pending_entry = {
+                    "decision_date": row["date"],
+                    "decision_close": close,
+                    "atr": atr,
+                    "ma_fast": ma_fast,
+                    "ma_slow": ma_slow,
+                    "entry_score": entry_score,
+                }
+
+    # --------------------------------------------------------
+    # 2D) Force close any open position at final close (backtest bookkeeping)
+    # --------------------------------------------------------
+    if in_position and (current_trade is not None):
+        last_row = df.iloc[-1]
+        final_close = float(last_row["close"])
+        exit_price = final_close * (1.0 - SLIPPAGE_PCT)
+
+        R_value = calculate_R(
+            exit_price=exit_price,
+            entry_price=float(current_trade["entry_price"]),
+            stop_price=float(current_trade["initial_stop_price"]),
+        )
+
+        pnl_dollars = (exit_price - float(current_trade["entry_price"])) * int(current_trade["shares"])
+        equity += pnl_dollars
+
+        current_trade.update({
+            "exit_date": last_row["date"],
+            "exit_open": float(last_row["open"]),
+            "exit_price": exit_price,
+            "R": R_value,
+            "pnl_dollars": pnl_dollars,
+            "equity_after": equity,
+            "exit_reason": "forced_final_close",
+        })
+
+        trades.append(current_trade)
 
     return pd.DataFrame(trades), equity
 
