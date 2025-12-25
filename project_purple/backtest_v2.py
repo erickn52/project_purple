@@ -491,87 +491,84 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
 
 def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
     """
-    Resolve the ONE canonical data directory for Project Purple.
+    Project Purple is locked to ONE canonical data directory:
 
-    Canonical (Option A):
-      - repo-root ./data
+        <repo_root>/data
 
-    Safety:
-      - If repo-root ./project_purple/data exists, hard-fail.
-        That folder is forbidden because it previously caused path ambiguity
-        and corrupted OHLCV ingestion.
+    Safety gate:
+      - If <repo_root>/project_purple/data exists, HARD FAIL.
+        That legacy folder caused path ambiguity and corrupted OHLCV.
 
-    Notes:
-      - data_dir (explicit) is allowed ONLY if it does NOT point into the forbidden legacy folder.
-      - project_root is allowed ONLY for project_root/data (NOT project_root/project_purple/data).
+    Note:
+      - We DO NOT auto-create folders here. If ./data is missing,
+        that's a setup problem (run the downloader / create the folder intentionally).
     """
     repo_root = Path(__file__).resolve().parents[1]
-    canonical = repo_root / "data"
-    legacy_bad = repo_root / "project_purple" / "data"  # DO NOT USE
+    canonical = (repo_root / "data").resolve()
+    legacy_bad = (repo_root / "project_purple" / "data").resolve()
 
-    # Hard gate: legacy folder must not exist (prevents silent reintroduction).
+    # Hard gate: forbidden legacy folder must never exist.
     if legacy_bad.exists():
         raise RuntimeError(
-            "Unsafe data directory detected:\n"
+            "Unsafe legacy data directory detected (MUST NOT EXIST):\n"
             f"  {legacy_bad}\n\n"
             "Project Purple is locked to ONE canonical data folder:\n"
             f"  {canonical}\n\n"
-            "Fix:\n"
-            "  1) Delete the legacy folder:\n"
-            f"     Remove-Item -Recurse -Force \"{legacy_bad}\"\n"
-            "  2) Re-run the system.\n"
+            "Fix (PowerShell):\n"
+            f'  Remove-Item -Recurse -Force "{legacy_bad}"\n'
         )
 
-    def _is_in_legacy_folder(p: Path) -> bool:
-        try:
-            p_res = p.resolve()
-        except Exception:
-            p_res = p
-
-        try:
-            legacy_res = legacy_bad.resolve()
-        except Exception:
-            legacy_res = legacy_bad
-
-        # Exact match or nested inside legacy folder
-        if p_res == legacy_res:
-            return True
-        try:
-            # Python 3.9+ Path.is_relative_to
-            return p_res.is_relative_to(legacy_res)
-        except Exception:
-            # Fallback for any odd path behavior
-            return str(legacy_res).lower().rstrip("\\/") in str(p_res).lower().rstrip("\\/")
-
-    # 1) explicit data_dir argument
+    # If caller passed an explicit data_dir, it must be canonical.
     if data_dir is not None:
-        p = Path(data_dir)
-        if _is_in_legacy_folder(p):
+        requested = Path(data_dir).resolve()
+        if requested == legacy_bad:
             raise RuntimeError(
-                "Refusing explicit data_dir because it points to the forbidden legacy folder:\n"
-                f"  data_dir={p}\n"
-                f"  legacy={legacy_bad}\n\n"
-                f"Use canonical folder:\n  {canonical}\n"
+                f"Refusing to use forbidden legacy data dir:\n  {requested}\n"
             )
-        return p
+        if requested != canonical:
+            raise RuntimeError(
+                "Project Purple is locked to ONE canonical data folder:\n"
+                f"  {canonical}\n\n"
+                "You passed data_dir:\n"
+                f"  {requested}\n\n"
+                "Fix: pass no data_dir (recommended) or pass the canonical ./data path."
+            )
+        return canonical
 
-    # 2) explicit project_root argument: ONLY allow project_root/data (NOT project_root/project_purple/data)
+    # If caller passed project_root, still enforce canonical.
     if project_root is not None:
-        pr = Path(project_root)
-        cand = pr / "data"
-        if _is_in_legacy_folder(cand):
+        pr = Path(project_root).resolve()
+        pr_legacy = (pr / "project_purple" / "data").resolve()
+        if pr_legacy.exists():
             raise RuntimeError(
-                "Refusing project_root/data because it resolves into the forbidden legacy folder:\n"
-                f"  candidate={cand}\n"
-                f"  legacy={legacy_bad}\n\n"
-                f"Use canonical folder:\n  {canonical}\n"
+                "Unsafe legacy data directory detected via project_root (MUST NOT EXIST):\n"
+                f"  {pr_legacy}\n\n"
+                "Fix (PowerShell):\n"
+                f'  Remove-Item -Recurse -Force "{pr_legacy}"\n'
             )
-        if cand.exists():
-            return cand
 
-    # 3) canonical repo-root ./data (create if missing)
-    canonical.mkdir(parents=True, exist_ok=True)
-    return canonical
+        pr_data = (pr / "data").resolve()
+        if pr_data.exists():
+            if pr_data != canonical:
+                raise RuntimeError(
+                    "Project Purple is locked to ONE canonical data folder:\n"
+                    f"  {canonical}\n\n"
+                    "But project_root/data resolved to:\n"
+                    f"  {pr_data}\n\n"
+                    "Fix: run from the repo root, or don’t pass project_root."
+                )
+            return canonical
+
+    if canonical.exists():
+        return canonical
+
+    raise RuntimeError(
+        "Canonical data directory not found:\n"
+        f"  {canonical}\n\n"
+        "Fix:\n"
+        "  1) Create ./data at the repo root\n"
+        "  2) Download data (run your downloader)\n"
+    )
 
 
 def run_backtest_for_symbol(
