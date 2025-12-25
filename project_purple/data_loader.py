@@ -6,7 +6,8 @@ from typing import Dict
 import pandas as pd
 
 
-# Keep this list in sync with data_downloader.TICKERS
+# Keep this list in sync with the project’s “known symbols” expectations.
+# (Downloader uses scanner symbols; loader can still keep a stable subset.)
 TICKERS = [
     "AAPL",
     "NVDA",
@@ -23,34 +24,36 @@ TICKERS = [
 
 def get_data_dir() -> Path:
     """
-    Resolve the canonical data directory.
+    Resolve the ONE canonical data directory.
 
-    Priority:
-      1) Repo-root ./data                        (canonical)
-      2) Repo-root ./project_purple/data         (legacy fallback)
-      3) Package ./data                          (fallback)
+    Canonical (Option A):
+      - repo-root ./data
 
-    IMPORTANT:
-      - We do NOT auto-create the legacy folder anymore,
-        because that can mask missing data (creates empty folders).
+    Safety:
+      - If repo-root ./project_purple/data exists, hard-fail.
+        That folder previously caused corrupted OHLCV + path ambiguity.
     """
     repo_root = Path(__file__).resolve().parents[1]
 
-    cand1 = repo_root / "data"
-    if cand1.exists():
-        return cand1
+    canonical = repo_root / "data"
+    legacy_bad = repo_root / "project_purple" / "data"  # DO NOT USE
 
-    cand2 = repo_root / "project_purple" / "data"
-    if cand2.exists():
-        return cand2
+    # Hard gate: this folder must not exist (prevents silent reintroduction).
+    if legacy_bad.exists():
+        raise RuntimeError(
+            "Unsafe data directory detected:\n"
+            f"  {legacy_bad}\n\n"
+            "Project Purple is locked to ONE canonical data folder:\n"
+            f"  {canonical}\n\n"
+            "Fix:\n"
+            "  1) Delete the legacy folder:\n"
+            f"     Remove-Item -Recurse -Force {legacy_bad}\n"
+            "  2) Re-run the system.\n"
+        )
 
-    cand3 = Path(__file__).resolve().parent / "data"
-    if cand3.exists():
-        return cand3
-
-    # If nothing exists, create canonical repo-root ./data
-    cand1.mkdir(parents=True, exist_ok=True)
-    return cand1
+    # Ensure canonical exists (but do not create legacy folders).
+    canonical.mkdir(parents=True, exist_ok=True)
+    return canonical
 
 
 def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -94,7 +97,11 @@ def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     df = df.reindex(columns=expected_cols)
 
     # Sort + de-dup dates (keep last)
-    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    df = (
+        df.sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
 
     return df
 
@@ -103,9 +110,8 @@ def load_symbol_daily(symbol: str) -> pd.DataFrame:
     """
     Load a single symbol's daily data from CSV.
 
-    Supports both:
-      - repo-root ./data/<SYMBOL>_daily.csv  (canonical)
-      - legacy ./project_purple/data/<SYMBOL>_daily.csv (fallback)
+    Canonical path only:
+      - repo-root ./data/<SYMBOL>_daily.csv
     """
     symbol = symbol.upper().strip()
 
@@ -113,7 +119,12 @@ def load_symbol_daily(symbol: str) -> pd.DataFrame:
     csv_path = data_dir / f"{symbol}_daily.csv"
 
     if not csv_path.exists():
-        raise FileNotFoundError(f"CSV for {symbol} not found at: {csv_path}")
+        raise FileNotFoundError(
+            f"CSV for {symbol} not found at: {csv_path}\n"
+            f"Canonical data dir is: {data_dir}\n"
+            "If you need to fetch data, run:\n"
+            f"  python -u .\\project_purple\\data_downloader.py --symbols {symbol}\n"
+        )
 
     raw = pd.read_csv(csv_path)
     df = _clean_daily_csv(raw=raw, symbol=symbol)
@@ -142,7 +153,8 @@ if __name__ == "__main__":
     print("Testing data_loader...")
 
     try:
-        print("Resolved data dir:", get_data_dir())
+        resolved = get_data_dir()
+        print("Resolved data dir:", resolved)
 
         spy_df = load_symbol_daily("SPY")
         print("\nSPY head:")
