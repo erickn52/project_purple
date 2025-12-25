@@ -19,6 +19,15 @@ from backtest_v2 import (
 )
 from risk import RiskConfig
 
+# Centralized regime policy (single source of truth).
+# Support running both:
+# - from inside project_purple/: python scanner_simple.py
+# - from repo root with sys.path tweaks / module import
+try:
+    from regime_risk import get_regime_policy
+except ModuleNotFoundError:  # pragma: no cover
+    from project_purple.regime_risk import get_regime_policy
+
 # ---------------------------------------------------------------------------
 # Universe selection settings (FAST screen)
 # ---------------------------------------------------------------------------
@@ -46,6 +55,9 @@ EDGE_MAX_DRAWDOWN_PCT = 35.0
 EDGE_TEST_INITIAL_EQUITY = 100_000.0
 EDGE_TEST_MAX_HOLD_DAYS = 10
 EDGE_TEST_TRAIL_ATR_MULTIPLE = 3.0  # keep in sync with main.py default
+
+# NEW: quality gate so we don't keep "barely-pass" symbols with negative edge_score
+EDGE_MIN_EDGE_SCORE = 0.0  # keep only symbols with edge_score > 0
 
 # Regime behavior
 CHOPPY_MAX_UNIVERSE = 5
@@ -326,6 +338,7 @@ def evaluate_symbol(symbol: str, as_of_date: Optional[Union[str, pd.Timestamp]] 
 def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> List[str]:
     market_regime = "UNKNOWN"
     risk_mult = 1.0
+    regime_policy = None
 
     try:
         state = get_market_state(symbol="SPY", as_of_date=as_of_date)
@@ -335,13 +348,15 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         print(f"Reason: {e}")
         state = None
 
-    if market_regime == "BULL":
-        risk_mult = 1.0
-    elif market_regime == "CHOPPY":
-        risk_mult = 0.5
-    elif market_regime == "BEAR":
-        risk_mult = 0.0
-    else:
+    # Centralized regime rules (single source of truth)
+    try:
+        regime_policy = get_regime_policy(market_regime)
+        risk_mult = float(regime_policy.risk_multiplier)
+    except Exception as e:
+        print("\nWARNING: Could not resolve regime policy from regime_risk.py.")
+        print(f"Regime: {market_regime!r}")
+        print(f"Reason: {e}")
+        regime_policy = None
         risk_mult = 1.0
 
     members: List[UniverseMember] = []
@@ -376,9 +391,16 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         "symbol", "included", "last_close", "avg_volume", "score", "ret20", "atr_pct", "ma_fast", "ma_slow"
     ]].to_string(index=False))
 
-    if market_regime == "BEAR":
-        print(f"\n=== MARKET REGIME: {RED}BEAR{RESET} ===")
-        print("Rule: do not trade longs in BEAR. Universe is empty.")
+    # Use centralized trade_long gate; fall back to prior behavior if policy unavailable.
+    trade_long_allowed = True
+    if regime_policy is not None:
+        trade_long_allowed = bool(regime_policy.trade_long)
+    else:
+        trade_long_allowed = (market_regime != "BEAR")
+
+    if not trade_long_allowed:
+        print(f"\n=== MARKET REGIME: {RED}{market_regime}{RESET} ===")
+        print("Rule: do not trade longs when trade_long=False. Universe is empty.")
         return []
 
     risk_config = RiskConfig(
@@ -463,19 +485,26 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         "edge_score", "edge_trades", "edge_avg_R", "edge_profit_factor", "edge_win_rate_pct", "edge_max_dd_pct"
     ]].sort_values(by=["edge_pass", "edge_score"], ascending=[False, False]).to_string(index=False))
 
+    # Shared “momentum alignment” condition (used in both CHOPPY and BULL)
+    momentum_mask = (df2["ret20"] > 0) & (df2["ma_fast"] > df2["ma_slow"])
+
+    # Shared “edge quality” condition: exclude negative edge_score even if edge_pass=True
+    edge_quality_mask = (df2["edge_score"] > EDGE_MIN_EDGE_SCORE)
+
     if market_regime == "CHOPPY":
         print(f"\n=== MARKET REGIME: {YELLOW}CHOPPY{RESET} ===")
         print("Rules:")
         print("  - Keep only edge-pass symbols")
-        print("  - Stricter selection: ret20 > 0 AND ma_fast > ma_slow")
+        print("  - Momentum alignment: ret20 > 0 AND ma_fast > ma_slow")
+        print(f"  - Edge quality gate: edge_score > {EDGE_MIN_EDGE_SCORE:.2f}")
         print(f"  - Keep top {CHOPPY_MAX_UNIVERSE} by edge_score")
         print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%} (1/2 of normal)")
 
         choppy_mask = (
             (df2["included"] == True) &
             (df2["edge_pass"] == True) &
-            (df2["ret20"] > 0) &
-            (df2["ma_fast"] > df2["ma_slow"])
+            momentum_mask &
+            edge_quality_mask
         )
         df_final = df2[choppy_mask].copy()
         df_final = df_final.sort_values(by="edge_score", ascending=False).head(CHOPPY_MAX_UNIVERSE)
@@ -484,10 +513,17 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         print(f"\n=== MARKET REGIME: {regime_str} ===")
         print("Rules:")
         print("  - Keep only edge-pass symbols")
+        print("  - Momentum alignment: ret20 > 0 AND ma_fast > ma_slow")
+        print(f"  - Edge quality gate: edge_score > {EDGE_MIN_EDGE_SCORE:.2f}")
         print(f"  - Keep top {BULL_MAX_UNIVERSE} by edge_score")
         print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%}")
 
-        bull_mask = (df2["included"] == True) & (df2["edge_pass"] == True)
+        bull_mask = (
+            (df2["included"] == True) &
+            (df2["edge_pass"] == True) &
+            momentum_mask &
+            edge_quality_mask
+        )
         df_final = df2[bull_mask].copy()
         df_final = df_final.sort_values(by="edge_score", ascending=False).head(BULL_MAX_UNIVERSE)
 
