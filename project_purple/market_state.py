@@ -1,6 +1,7 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, Union
 
+import sys
 import numpy as np
 import pandas as pd
 
@@ -14,9 +15,6 @@ REGIME_ATR_WINDOW = 14
 MARKET_SYMBOL = "SPY"  # we can parameterize later if needed
 
 # Risk multipliers by regime (applies to base risk_per_trade_pct in main.py)
-# - BULL: full risk
-# - CHOPPY: reduced risk (still allowed to trade long, but smaller)
-# - BEAR: no long trades (trade_long False); multiplier effectively 0
 RISK_MULTIPLIER_BY_REGIME = {
     "BULL": 1.00,
     "CHOPPY": 0.50,
@@ -43,29 +41,17 @@ class MarketState:
 
     @property
     def trade_long(self) -> bool:
-        """
-        True when it is OK to take new long trades.
-        For now: allowed in BULL or CHOPPY, blocked in BEAR.
-        """
+        """Allowed in BULL or CHOPPY, blocked in BEAR."""
         return self.regime != "BEAR"
 
     @property
     def market_long_ok(self) -> bool:
-        """
-        Backwards-compatible alias used by other modules (signals, etc.).
-        Same meaning as trade_long.
-        """
+        """Backwards-compatible alias used by other modules."""
         return self.trade_long
 
     @property
     def risk_multiplier(self) -> float:
-        """
-        Multiplier applied to base risk per trade based on market regime.
-
-        Intended use (in main.py):
-            effective_risk_pct = base_risk_pct * state.risk_multiplier
-        """
-        # If a new/unknown regime ever appears, be conservative.
+        """Multiplier applied to base risk per trade based on market regime."""
         return float(RISK_MULTIPLIER_BY_REGIME.get(self.regime, 0.00))
 
 
@@ -82,17 +68,51 @@ def _compute_atr(df: pd.DataFrame, window: int) -> pd.Series:
     return atr
 
 
-def get_market_state(symbol: str = MARKET_SYMBOL) -> MarketState:
+def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]]) -> Optional[pd.Timestamp]:
+    if as_of_date is None:
+        return None
+    ts = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"Invalid as_of_date: {as_of_date!r}")
+    return ts
+
+
+def get_market_state(
+    symbol: str = MARKET_SYMBOL,
+    as_of_date: Optional[Union[str, pd.Timestamp]] = None,
+) -> MarketState:
     """
     Load daily data for the given market symbol (default SPY),
-    compute regime on the most recent bar, and return a MarketState object.
+    compute regime on the most recent bar (or on the bar at/just before as_of_date),
+    and return a MarketState object.
+
+    HR2:
+      - If as_of_date is provided, we ONLY use rows with date <= as_of_date.
+        This prevents lookahead bias in historical simulation.
     """
     df = load_symbol_daily(symbol)
-
     if df.empty:
         raise ValueError(f"No data loaded for symbol {symbol}")
 
     df = df.copy()
+
+    # Normalize / sanitize dates
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "open", "high", "low", "close"]).copy()
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # Apply as-of cutoff (inclusive)
+    as_of_ts = _normalize_as_of_date(as_of_date)
+    if as_of_ts is not None:
+        df = df[df["date"] <= as_of_ts].copy()
+        df = df.sort_values("date").reset_index(drop=True)
+
+    if df.empty:
+        raise ValueError(
+            f"No usable rows for symbol {symbol} as of {as_of_ts.date() if as_of_ts is not None else 'N/A'}"
+        )
+
+    # Indicators
     df["ma_fast"] = df["close"].rolling(
         window=REGIME_FAST_MA, min_periods=REGIME_FAST_MA
     ).mean()
@@ -104,22 +124,29 @@ def get_market_state(symbol: str = MARKET_SYMBOL) -> MarketState:
     last = df.iloc[-1]
 
     close = float(last["close"])
-    ma_fast = float(last["ma_fast"])
-    ma_slow = float(last["ma_slow"])
+    ma_fast = float(last["ma_fast"]) if not np.isnan(last["ma_fast"]) else float("nan")
+    ma_slow = float(last["ma_slow"]) if not np.isnan(last["ma_slow"]) else float("nan")
     atr = float(last["atr"]) if not np.isnan(last["atr"]) else None
-    as_of_date = pd.to_datetime(last["date"])
+    bar_date = pd.to_datetime(last["date"])
+
+    # Regime requires slow MA to exist; otherwise results are undefined.
+    if np.isnan(ma_slow):
+        raise ValueError(
+            f"Insufficient history to compute {REGIME_SLOW_MA}MA for {symbol}"
+            + (f" as of {as_of_ts.date()}" if as_of_ts is not None else "")
+        )
 
     # --- Simple regime classification ----------------------------------------
-    if not np.isnan(ma_slow) and close > ma_slow and ma_fast > ma_slow:
+    if close > ma_slow and (not np.isnan(ma_fast)) and ma_fast > ma_slow:
         regime = "BULL"
-    elif not np.isnan(ma_slow) and close < ma_slow:
+    elif close < ma_slow:
         regime = "BEAR"
     else:
         regime = "CHOPPY"
 
     return MarketState(
         symbol=symbol,
-        as_of_date=as_of_date,
+        as_of_date=bar_date,
         regime=regime,
         close=close,
         ma_fast=ma_fast,
@@ -129,9 +156,12 @@ def get_market_state(symbol: str = MARKET_SYMBOL) -> MarketState:
 
 
 if __name__ == "__main__":
-    state = get_market_state()
+    # Usage:
+    #   python -u .\project_purple\market_state.py
+    #   python -u .\project_purple\market_state.py 2023-12-29
+    arg_as_of = sys.argv[1] if len(sys.argv) > 1 else None
+    state = get_market_state(as_of_date=arg_as_of)
 
-    # Color the regime
     if state.regime == "BULL":
         regime_str = f"{GREEN}{state.regime}{RESET}"
     elif state.regime == "BEAR":
@@ -139,9 +169,7 @@ if __name__ == "__main__":
     else:
         regime_str = f"{YELLOW}{state.regime}{RESET}"
 
-    trade_long_str = (
-        f"{GREEN}True{RESET}" if state.trade_long else f"{RED}False{RESET}"
-    )
+    trade_long_str = f"{GREEN}True{RESET}" if state.trade_long else f"{RED}False{RESET}"
 
     print("\n=== MARKET STATE ===")
     print(f"Symbol:         {state.symbol}")
