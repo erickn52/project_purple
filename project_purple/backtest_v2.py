@@ -491,31 +491,87 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
 
 def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
     """
-    Resolution order:
-    1) explicit data_dir argument
-    2) explicit project_root argument (project_root/data or project_root/project_purple/data)
-    3) inferred repo-root data: <repo_root>/data  (preferred)
-    4) fallback: <this_file_dir>/data  (project_purple/data)
-    """
-    if data_dir is not None:
-        return Path(data_dir)
+    Resolve the ONE canonical data directory for Project Purple.
 
+    Canonical (Option A):
+      - repo-root ./data
+
+    Safety:
+      - If repo-root ./project_purple/data exists, hard-fail.
+        That folder is forbidden because it previously caused path ambiguity
+        and corrupted OHLCV ingestion.
+
+    Notes:
+      - data_dir (explicit) is allowed ONLY if it does NOT point into the forbidden legacy folder.
+      - project_root is allowed ONLY for project_root/data (NOT project_root/project_purple/data).
+    """
+    repo_root = Path(__file__).resolve().parents[1]
+    canonical = repo_root / "data"
+    legacy_bad = repo_root / "project_purple" / "data"  # DO NOT USE
+
+    # Hard gate: legacy folder must not exist (prevents silent reintroduction).
+    if legacy_bad.exists():
+        raise RuntimeError(
+            "Unsafe data directory detected:\n"
+            f"  {legacy_bad}\n\n"
+            "Project Purple is locked to ONE canonical data folder:\n"
+            f"  {canonical}\n\n"
+            "Fix:\n"
+            "  1) Delete the legacy folder:\n"
+            f"     Remove-Item -Recurse -Force \"{legacy_bad}\"\n"
+            "  2) Re-run the system.\n"
+        )
+
+    def _is_in_legacy_folder(p: Path) -> bool:
+        try:
+            p_res = p.resolve()
+        except Exception:
+            p_res = p
+
+        try:
+            legacy_res = legacy_bad.resolve()
+        except Exception:
+            legacy_res = legacy_bad
+
+        # Exact match or nested inside legacy folder
+        if p_res == legacy_res:
+            return True
+        try:
+            # Python 3.9+ Path.is_relative_to
+            return p_res.is_relative_to(legacy_res)
+        except Exception:
+            # Fallback for any odd path behavior
+            return str(legacy_res).lower().rstrip("\\/") in str(p_res).lower().rstrip("\\/")
+
+    # 1) explicit data_dir argument
+    if data_dir is not None:
+        p = Path(data_dir)
+        if _is_in_legacy_folder(p):
+            raise RuntimeError(
+                "Refusing explicit data_dir because it points to the forbidden legacy folder:\n"
+                f"  data_dir={p}\n"
+                f"  legacy={legacy_bad}\n\n"
+                f"Use canonical folder:\n  {canonical}\n"
+            )
+        return p
+
+    # 2) explicit project_root argument: ONLY allow project_root/data (NOT project_root/project_purple/data)
     if project_root is not None:
         pr = Path(project_root)
-        cand1 = pr / "data"
-        if cand1.exists():
-            return cand1
-        cand2 = pr / "project_purple" / "data"
-        if cand2.exists():
-            return cand2
+        cand = pr / "data"
+        if _is_in_legacy_folder(cand):
+            raise RuntimeError(
+                "Refusing project_root/data because it resolves into the forbidden legacy folder:\n"
+                f"  candidate={cand}\n"
+                f"  legacy={legacy_bad}\n\n"
+                f"Use canonical folder:\n  {canonical}\n"
+            )
+        if cand.exists():
+            return cand
 
-    # Inferred repo root: repo_root/project_purple/backtest_v2.py -> repo_root = parents[1]
-    inferred_root = Path(__file__).resolve().parents[1]
-    cand_repo_data = inferred_root / "data"
-    if cand_repo_data.exists():
-        return cand_repo_data
-
-    return Path(__file__).resolve().parent / "data"
+    # 3) canonical repo-root ./data (create if missing)
+    canonical.mkdir(parents=True, exist_ok=True)
+    return canonical
 
 
 def run_backtest_for_symbol(
