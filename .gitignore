@@ -1,11 +1,13 @@
 # -------------------------
 # Python & Virtual Environment
 # -------------------------
-venv/
 __pycache__/
 *.pyc
 *.pyo
 *.pyd
+
+.venv/
+venv/
 
 # -------------------------
 # IDE / Editor Files (PyCharm, IntelliJ)
@@ -14,50 +16,40 @@ __pycache__/
 *.iml
 
 # -------------------------
-# Environment Variables
+# Environment Variables / Secrets
 # -------------------------
 .env
+.env.*
 
 # -------------------------
-# Data Files (CSV, HDF5, Parquet, etc.)
-# Prevent repo from ballooning
+# Data Files (generated market data; do not version)
+# Canonical data folder is repo-root ./data
 # -------------------------
-data/*.csv
-data/*.json
-data/*.parquet
-data/*.h5
+/data/*.csv
+/data/*.json
+/data/*.parquet
+/data/*.h5
 
 # -------------------------
-# Logs, Outputs, Checkpoints
+# Logs, Outputs
 # -------------------------
 logs/
 *.log
 
-# Model checkpoints (if you ever build ML models)
+# -------------------------
+# Model artifacts (if used later)
+# -------------------------
 checkpoints/
 models/
 
 # -------------------------
-# Cache, Temp Files
+# Cache / Temp / OS junk
 # -------------------------
 *.cache
 *.tmp
 .DS_Store
 
-# Env files (do not commit secrets)
-.env
-.env.*
-
-# Virtual environments
-.venv/
-venv/
-
-# Env files (do not commit secrets)
-.env
-.env.*
-
-# Generated market data (do not version)
-project_purple/data/*.csv
-
+# -------------------------
 # NEVER use package data dir (legacy / corrupted)
-project_purple/data/
+# -------------------------
+/project_purple/data/
