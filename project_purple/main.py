@@ -63,8 +63,19 @@ def apply_portfolio_policy_A(
         )
 
     df = combined_trades.copy()
-    df["entry_date"] = pd.to_datetime(df["entry_date"])
-    df["exit_date"] = pd.to_datetime(df["exit_date"])
+
+    # ---- Normalize entry/exit dates to tz-naive midnight to avoid tz-aware conversion crashes ----
+    entry = pd.to_datetime(df["entry_date"], errors="coerce", utc=True)
+    if entry.isna().any():
+        bad = df.loc[entry.isna(), ["entry_date"]].head(10).to_dict(orient="records")
+        raise ValueError(f"Policy A: entry_date contains unparseable values (examples: {bad})")
+    df["entry_date"] = entry.dt.tz_convert(None).dt.normalize()
+
+    exit_ = pd.to_datetime(df["exit_date"], errors="coerce", utc=True)
+    if exit_.isna().any():
+        bad = df.loc[exit_.isna(), ["exit_date"]].head(10).to_dict(orient="records")
+        raise ValueError(f"Policy A: exit_date contains unparseable values (examples: {bad})")
+    df["exit_date"] = exit_.dt.tz_convert(None).dt.normalize()
 
     # Pick best-per-day by entry_score if present; else keep all and we'll pick first.
     if "entry_score" in df.columns:

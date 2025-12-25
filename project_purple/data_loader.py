@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import pandas as pd
+from pandas.api.types import is_datetime64_any_dtype
 
 
 # Keep this list in sync with the project’s “known symbols” expectations.
@@ -55,20 +56,53 @@ def get_data_dir() -> Path:
     return canonical
 
 
+def _normalize_dates_to_naive_midnight(series: pd.Series, symbol: str) -> pd.Series:
+    """
+    Convert a date-like series that may contain:
+      - 'YYYY-MM-DD'
+      - 'YYYY-MM-DD 00:00:00-05:00'
+      - mixed tz-aware / tz-naive strings
+    into a single canonical dtype:
+      datetime64[ns] (tz-naive), normalized to midnight.
+
+    Key: utc=True makes pandas parse mixed timezones into a consistent tz-aware type,
+    which we then strip back to tz-naive.
+    """
+    # Stringify to reduce weird mixed types (Timestamp, datetime, str, etc.)
+    s = series.astype(str).str.strip()
+
+    # Parse with utc=True to avoid "mixed timezone" object dtype.
+    dt = pd.to_datetime(s, errors="coerce", utc=True)
+
+    # Strip timezone to tz-naive datetime64[ns]
+    # (tz_convert(None) removes tz info while preserving absolute time)
+    dt = dt.dt.tz_convert(None)
+
+    # Normalize to midnight (date-only semantics)
+    dt = dt.dt.normalize()
+
+    return dt
+
+
 def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     """
     Normalize your CSVs into:
       date, symbol, open, high, low, close, volume
 
-    Handles the "Price" date column, and filters out junk rows like:
-      Ticker,<sym>,<sym>,...
-      date,,,,,,
+    Handles:
+      - the "Price" date column
+      - junk rows like: Ticker,<sym>,<sym>,... or date,,,,,,
+      - mixed tz-aware/tz-naive date strings
     """
     df = raw.copy()
 
     # Standardize date column name
     if "Price" in df.columns and "date" not in df.columns:
         df = df.rename(columns={"Price": "date"})
+
+    # If symbol column is missing, create it (we'll force it anyway later)
+    if "symbol" not in df.columns:
+        df["symbol"] = symbol
 
     required = {"date", "symbol", "open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
@@ -77,18 +111,21 @@ def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
 
     # Remove obvious junk header rows that appear inside the file
     date_str = df["date"].astype(str).str.strip().str.lower()
-    bad_tokens = {"ticker", "date", "", "nan", "none"}
+    bad_tokens = {"ticker", "date", "price", "", "nan", "none"}
     df = df[~date_str.isin(bad_tokens)].copy()
 
-    # Parse dates
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    # Canonicalize dates: tz-safe, tz-naive, midnight-normalized
+    df["date"] = _normalize_dates_to_naive_midnight(df["date"], symbol=symbol)
     df = df.dropna(subset=["date"]).copy()
+
+    # Force symbol to match the filename / requested symbol (single source of truth)
+    df["symbol"] = symbol.upper().strip()
 
     # Numeric conversion
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows with missing OHLC (volume can be NaN in some feeds, but we want it too)
+    # Drop rows with missing OHLCV
     df = df.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
 
     # Ensure expected column order
@@ -110,7 +147,7 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
     Strict OHLCV validation for downstream consumers.
     Ensures we do not silently operate on corrupted data.
     """
-    required = {"date", "open", "high", "low", "close", "volume"}
+    required = {"date", "symbol", "open", "high", "low", "close", "volume"}
     missing = required - set(df.columns)
     if missing:
         raise ValueError(f"[{symbol}] Validation failed: missing columns {sorted(missing)}")
@@ -118,8 +155,16 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
     if df.empty:
         raise ValueError(f"[{symbol}] Validation failed: dataframe is empty")
 
+    # Date must be real datetime64 (tz-naive) and normalized to midnight
+    if not is_datetime64_any_dtype(df["date"]):
+        raise ValueError(f"[{symbol}] Validation failed: date is not datetime64 dtype")
+
     if df["date"].isna().any():
         raise ValueError(f"[{symbol}] Validation failed: date contains NaT/NaN")
+
+    # Enforce our date-only semantics: date == normalize(date)
+    if (df["date"] != df["date"].dt.normalize()).any():
+        raise ValueError(f"[{symbol}] Validation failed: date not normalized to midnight")
 
     if not df["date"].is_monotonic_increasing:
         raise ValueError(f"[{symbol}] Validation failed: dates not sorted ascending")
@@ -128,6 +173,12 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
     if dupes.any():
         examples = df.loc[dupes, ["date"]].head(10).to_dict(orient="records")
         raise ValueError(f"[{symbol}] Validation failed: duplicate dates (examples: {examples})")
+
+    # Symbol must be single-valued and match the requested symbol
+    if df["symbol"].nunique() != 1:
+        raise ValueError(f"[{symbol}] Validation failed: symbol column has {df['symbol'].nunique()} unique values")
+    if str(df["symbol"].iloc[0]).upper() != symbol.upper():
+        raise ValueError(f"[{symbol}] Validation failed: symbol mismatch: col={df['symbol'].iloc[0]}")
 
     # OHLC must be numeric, finite, and > 0
     for c in ["open", "high", "low", "close"]:
@@ -206,6 +257,39 @@ def load_all_daily() -> Dict[str, pd.DataFrame]:
     return data
 
 
+def validate_all_csvs_in_data_dir() -> List[Tuple[str, str]]:
+    """
+    Validate *every* *_daily.csv in the canonical ./data directory.
+    Returns a list of failures as (symbol, error_string). Empty list == all good.
+    """
+    data_dir = get_data_dir()
+    paths = sorted(data_dir.glob("*_daily.csv"))
+    print(f"CSV count: {len(paths)}")
+
+    failures: List[Tuple[str, str]] = []
+
+    for p in paths:
+        symbol = p.name.replace("_daily.csv", "").upper().strip()
+        try:
+            raw = pd.read_csv(p)
+            df = _clean_daily_csv(raw=raw, symbol=symbol)
+            _validate_ohlcv_dataframe(df=df, symbol=symbol)
+
+            last = df["date"].max()
+            last_str = last.strftime("%Y-%m-%d") if pd.notna(last) else "NA"
+            print(f"OK   {symbol:6s} rows={len(df):5d} last={last_str}")
+        except Exception as e:
+            msg = str(e).splitlines()[0]
+            failures.append((symbol, msg))
+            print(f"FAIL {symbol:6s} {msg}")
+
+    print(f"\nFailures: {len(failures)}")
+    for sym, msg in failures[:50]:
+        print(f" - {sym}: {msg}")
+
+    return failures
+
+
 if __name__ == "__main__":
     # Simple diagnostics when you run this file directly
     print("Testing data_loader...")
@@ -214,6 +298,12 @@ if __name__ == "__main__":
         resolved = get_data_dir()
         print("Resolved data dir:", resolved)
 
+        # HARD GATE: validate everything we have on disk
+        failures = validate_all_csvs_in_data_dir()
+        if failures:
+            raise SystemExit(1)
+
+        # Sanity: show SPY
         spy_df = load_symbol_daily("SPY")
         print("\nSPY head:")
         print(spy_df.head())
@@ -221,5 +311,8 @@ if __name__ == "__main__":
         print("\nSPY tail:")
         print(spy_df.tail(3)[["date", "close"]])
 
+    except SystemExit as e:
+        raise
     except Exception as e:
         print(f"Error while loading data: {e}")
+        raise

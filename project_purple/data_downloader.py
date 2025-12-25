@@ -12,145 +12,153 @@ try:
 except Exception:
     from scanner_simple import CANDIDATE_SYMBOLS  # type: ignore
 
-# Use the SAME canonical data-dir resolver as the loader (Option A: repo-root ./data)
-try:
-    from project_purple.data_loader import get_data_dir  # type: ignore
-except Exception:
-    from data_loader import get_data_dir  # type: ignore
-
-# Backward compatibility: other parts of the project may still reference TICKERS.
 TICKERS = CANDIDATE_SYMBOLS
+
+
+def _repo_root() -> Path:
+    # __file__ = .../project_purple/project_purple/data_downloader.py
+    # parents[0] -> .../project_purple/project_purple
+    # parents[1] -> .../project_purple (repo root)
+    return Path(__file__).resolve().parents[1]
+
+
+def _canonical_data_dir() -> Path:
+    """
+    Canonical location for market data is repo-root /data (Option A).
+    """
+    data_dir = _repo_root() / "data"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return data_dir
 
 
 def _validate_ohlcv(df: pd.DataFrame, symbol: str) -> None:
     """
-    Raise ValueError if we detect obviously corrupt OHLCV.
-    Focused validation (matches the known failure modes):
-      - NaNs in OHLC
-      - high < low
+    Strict-but-practical OHLCV validation to prevent corrupted data
+    from entering the pipeline.
     """
-    required = ["date", "symbol", "open", "high", "low", "close", "volume"]
+    required = ["date", "open", "high", "low", "close", "volume"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         raise ValueError(f"{symbol}: missing columns {missing}")
 
-    if df[["open", "high", "low", "close"]].isna().any().any():
-        raise ValueError(f"{symbol}: NaNs detected in OHLC columns")
+    if df.empty:
+        raise ValueError(f"{symbol}: dataframe is empty")
 
-    bad = (df["high"] < df["low"]).sum()
-    if bad > 0:
-        raise ValueError(f"{symbol}: Validation failed: high < low on {bad} rows")
+    if df["date"].isna().any():
+        raise ValueError(f"{symbol}: date contains NaT/NaN")
+
+    # OHLC must be numeric and > 0
+    for c in ["open", "high", "low", "close"]:
+        if df[c].isna().any():
+            raise ValueError(f"{symbol}: {c} has NaN")
+        if (df[c] <= 0).any():
+            bad = df.loc[df[c] <= 0, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+            raise ValueError(f"{symbol}: {c} <= 0 (examples: {bad})")
+
+    # high >= low
+    bad_hl = df["high"] < df["low"]
+    if bad_hl.any():
+        bad = df.loc[bad_hl, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"{symbol}: high < low (examples: {bad})")
+
+    # open/close within [low, high]
+    bad_open = (df["open"] < df["low"]) | (df["open"] > df["high"])
+    if bad_open.any():
+        bad = df.loc[bad_open, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"{symbol}: open outside [low, high] (examples: {bad})")
+
+    bad_close = (df["close"] < df["low"]) | (df["close"] > df["high"])
+    if bad_close.any():
+        bad = df.loc[bad_close, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"{symbol}: close outside [low, high] (examples: {bad})")
+
+    # volume must be numeric and >= 0
+    vol = pd.to_numeric(df["volume"], errors="coerce")
+    if vol.isna().any():
+        raise ValueError(f"{symbol}: volume has NaN/non-numeric")
+    if (vol < 0).any():
+        bad = df.loc[vol < 0, ["date", "volume"]].head(10).to_dict(orient="records")
+        raise ValueError(f"{symbol}: volume < 0 (examples: {bad})")
 
 
-def _build_project_df(symbol: str, hist: pd.DataFrame) -> pd.DataFrame:
+def _build_clean_daily_df(symbol: str, hist: pd.DataFrame) -> pd.DataFrame:
     """
-    Convert yfinance history() dataframe to Project Purple canonical daily format:
+    Convert yfinance history() into Project Purple's clean CSV shape:
 
-        date, symbol, open, high, low, close, volume
+      date, symbol, open, high, low, close, volume
 
-    No extra "Ticker/date" header rows (those caused confusion and extra cleaning).
+    NO junk header rows. NO 'Price' column name.
     """
     needed_cols = ["Open", "High", "Low", "Close", "Volume"]
     missing = [c for c in needed_cols if c not in hist.columns]
     if missing:
         raise ValueError(f"{symbol}: yfinance history missing columns: {missing}")
 
-    df = pd.DataFrame(
+    df = hist.copy()
+
+    # yfinance index is dates; normalize into a real 'date' column
+    df = df.reset_index()
+
+    # Index column can be 'Date' or 'Datetime' depending on interval
+    if "Date" in df.columns:
+        date_col = "Date"
+    elif "Datetime" in df.columns:
+        date_col = "Datetime"
+    else:
+        # fallback: first column is usually the index
+        date_col = df.columns[0]
+
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+    df["symbol"] = symbol
+
+    out = pd.DataFrame(
         {
-            "date": pd.to_datetime(hist.index).tz_localize(None),
-            "symbol": symbol,
-            "open": pd.to_numeric(hist["Open"].to_numpy().ravel(), errors="coerce"),
-            "high": pd.to_numeric(hist["High"].to_numpy().ravel(), errors="coerce"),
-            "low": pd.to_numeric(hist["Low"].to_numpy().ravel(), errors="coerce"),
-            "close": pd.to_numeric(hist["Close"].to_numpy().ravel(), errors="coerce"),
-            "volume": pd.to_numeric(hist["Volume"].to_numpy().ravel(), errors="coerce"),
+            "date": df["date"],
+            "symbol": df["symbol"],
+            "open": pd.to_numeric(df["Open"], errors="coerce"),
+            "high": pd.to_numeric(df["High"], errors="coerce"),
+            "low": pd.to_numeric(df["Low"], errors="coerce"),
+            "close": pd.to_numeric(df["Close"], errors="coerce"),
+            "volume": pd.to_numeric(df["Volume"], errors="coerce"),
         }
     )
 
-    df = df.dropna(subset=["date", "open", "high", "low", "close"]).copy()
-    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+    out = out.dropna(subset=["date", "open", "high", "low", "close", "volume"]).copy()
 
-    _validate_ohlcv(df, symbol)
-    return df
+    # Sort + de-dup (keep last row for a date if duplicates occur)
+    out = (
+        out.sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
 
-
-def _read_existing_clean(csv_path: Path, symbol: str) -> pd.DataFrame:
-    """
-    Read an existing CSV and normalize it into canonical columns.
-    Handles both:
-      - legacy format: Price, symbol, open, high, low, close, volume (+ junk header rows)
-      - canonical format: date, symbol, open, high, low, close, volume
-    """
-    raw = pd.read_csv(csv_path)
-
-    df = raw.copy()
-
-    # legacy "Price" -> canonical "date"
-    if "Price" in df.columns and "date" not in df.columns:
-        df = df.rename(columns={"Price": "date"})
-
-    required = {"date", "symbol", "open", "high", "low", "close", "volume"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"{symbol}: existing CSV missing columns: {sorted(missing)}")
-
-    # strip junk rows like "Ticker", "date", blanks
-    date_str = df["date"].astype(str).str.strip().str.lower()
-    bad_tokens = {"ticker", "date", "", "nan", "none"}
-    df = df[~date_str.isin(bad_tokens)].copy()
-
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date"]).copy()
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df = df.dropna(subset=["open", "high", "low", "close"]).copy()
-
-    df = df[["date", "symbol", "open", "high", "low", "close", "volume"]].copy()
-    df["symbol"] = df["symbol"].astype(str).str.upper().str.strip()
-
-    df = df.sort_values("date").drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
-
-    _validate_ohlcv(df, symbol)
-    return df
-
-
-def _atomic_write_csv(df: pd.DataFrame, out_path: Path) -> None:
-    tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
-    df.to_csv(tmp_path, index=False)
-    tmp_path.replace(out_path)
+    _validate_ohlcv(out, symbol)
+    return out
 
 
 def download_and_save_daily_data(
     symbols: Optional[List[str]] = None,
     period: str = "10y",
     interval: str = "1d",
-    overwrite: bool = False,
 ) -> None:
     """
-    Download daily OHLCV data using yfinance and save CSVs to canonical repo-root /data.
+    Download daily OHLCV data using yfinance and save clean CSVs to canonical repo-root /data.
 
     Behavior:
-      - overwrite=True  -> replace <SYMBOL>_daily.csv
-      - overwrite=False -> SAFE UPDATE:
-            if file exists, merge new rows into it (dedupe by date),
-            write backup, then write updated canonical CSV to <SYMBOL>_daily.csv
-
-    This prevents the "download_*.csv exists but system still reads stale <SYMBOL>_daily.csv" trap.
+    - ALWAYS writes clean columns: date,symbol,open,high,low,close,volume
+    - If <SYMBOL>_daily.csv exists, we create a timestamped backup first, then replace it.
+    - Uses atomic write (tmp -> replace) to avoid half-written files.
     """
-    data_dir = get_data_dir()
-
-    use_symbols = symbols if symbols else list(TICKERS)
+    data_dir = _canonical_data_dir()
+    use_symbols = [s.upper().strip() for s in (symbols if symbols else list(TICKERS))]
 
     print(f"Saving CSVs to (canonical): {data_dir}")
     print(f"Symbols to download ({len(use_symbols)}): {use_symbols}")
-    print(f"yfinance: period={period}, interval={interval}, overwrite={overwrite}")
+    print(f"yfinance: period={period}, interval={interval}")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
     for symbol in use_symbols:
-        symbol = symbol.upper().strip()
         print(f"\nDownloading {symbol} daily data with yfinance...")
 
         try:
@@ -169,96 +177,78 @@ def download_and_save_daily_data(
             continue
 
         try:
-            new_df = _build_project_df(symbol, hist)
+            clean_df = _build_clean_daily_df(symbol, hist)
         except Exception as e:
-            print(f"  ERROR: Could not build validated dataframe for {symbol}: {e}")
+            print(f"  ERROR: Could not build validated CSV for {symbol}: {e}")
             continue
 
-        standard_path = data_dir / f"{symbol}_daily.csv"
+        out_path = data_dir / f"{symbol}_daily.csv"
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
 
-        # If overwrite is requested, just write canonical and be done.
-        if overwrite or not standard_path.exists():
+        backup_path = None
+        if out_path.exists():
+            backup_path = data_dir / f"{symbol}_daily.bak_{timestamp}.csv"
             try:
-                _atomic_write_csv(new_df, standard_path)
-                print(f"  Saved {symbol} to: {standard_path}")
-                print(f"  Rows: {len(new_df)} | Last date: {new_df['date'].iloc[-1].date()}")
-            except PermissionError:
-                print(
-                    f"  ERROR: Permission denied writing {standard_path}.\n"
-                    f"         Close Excel or any program using this file, then run again."
-                )
+                out_path.replace(backup_path)
             except Exception as e:
-                print(f"  ERROR saving {symbol} to {standard_path}: {e}")
-            continue
-
-        # SAFE UPDATE path: merge existing + new, backup old file, then write merged
-        try:
-            existing_df = _read_existing_clean(standard_path, symbol)
-        except Exception as e:
-            print(f"  WARNING: Could not read/clean existing {standard_path.name}: {e}")
-            print("  Proceeding by writing NEW canonical file (backup created).")
-            existing_df = pd.DataFrame(columns=["date", "symbol", "open", "high", "low", "close", "volume"])
-
-        merged = pd.concat([existing_df, new_df], ignore_index=True)
-        merged["date"] = pd.to_datetime(merged["date"], errors="coerce")
-        merged = merged.dropna(subset=["date"]).sort_values("date")
-        merged = merged.drop_duplicates(subset=["date"], keep="last").reset_index(drop=True)
+                print(f"  ERROR: Could not create backup for {symbol}: {e}")
+                continue
 
         try:
-            _validate_ohlcv(merged, symbol)
-        except Exception as e:
-            print(f"  ERROR: merged data failed validation for {symbol}: {e}")
-            print("  Keeping existing file unchanged.")
-            continue
+            clean_df.to_csv(tmp_path, index=False)
+            tmp_path.replace(out_path)
 
-        backup_path = data_dir / f"{symbol}_daily.bak_{timestamp}.csv"
-        try:
-            # backup existing file first
-            standard_path.replace(backup_path)
-            # write merged to standard path
-            _atomic_write_csv(merged, standard_path)
+            last_date = clean_df["date"].iloc[-1].date()
             print(f"  Updated {symbol} safely:")
-            print(f"    Backup: {backup_path.name}")
-            print(f"    Current: {standard_path.name}")
-            print(f"    Rows: {len(merged)} | Last date: {merged['date'].iloc[-1].date()}")
+            if backup_path is not None:
+                print(f"    Backup: {backup_path.name}")
+            print(f"    Current: {out_path.name}")
+            print(f"    Rows: {len(clean_df)} | Last date: {last_date}")
+
         except PermissionError:
             print(
-                f"  ERROR: Permission denied updating {standard_path}.\n"
+                f"  ERROR: Permission denied writing {out_path}.\n"
                 f"         Close Excel or any program using this file, then run again."
             )
-            # attempt to restore backup if we already moved it
+            # try to restore from backup if we made one and the write failed
             try:
-                if backup_path.exists() and not standard_path.exists():
-                    backup_path.replace(standard_path)
+                if tmp_path.exists():
+                    tmp_path.unlink()
             except Exception:
                 pass
+
+            if backup_path is not None and backup_path.exists() and not out_path.exists():
+                try:
+                    backup_path.replace(out_path)
+                except Exception:
+                    pass
+
         except Exception as e:
-            print(f"  ERROR updating {symbol}: {e}")
-            # attempt to restore backup
+            print(f"  ERROR saving {symbol} to {out_path}: {e}")
             try:
-                if backup_path.exists() and not standard_path.exists():
-                    backup_path.replace(standard_path)
+                if tmp_path.exists():
+                    tmp_path.unlink()
             except Exception:
                 pass
+
+            # restore from backup if we made one and the write failed
+            if backup_path is not None and backup_path.exists() and not out_path.exists():
+                try:
+                    backup_path.replace(out_path)
+                except Exception:
+                    pass
 
 
 def _parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Download daily OHLCV CSVs to repo-root /data.")
+    p = argparse.ArgumentParser(description="Download daily OHLCV CSVs to repo-root /data (clean format).")
     p.add_argument(
         "--symbols",
         nargs="*",
         default=None,
-        help="Optional list of symbols to download (e.g., --symbols SPY AAPL). "
-             "If omitted, uses scanner CANDIDATE_SYMBOLS.",
+        help="Optional list of symbols to download (e.g., --symbols SPY AAPL). If omitted, uses scanner CANDIDATE_SYMBOLS.",
     )
     p.add_argument("--period", default="10y", help="yfinance period (default: 10y)")
     p.add_argument("--interval", default="1d", help="yfinance interval (default: 1d)")
-    p.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing <SYMBOL>_daily.csv files in /data. "
-             "If not set, existing files are safely updated via merge + backup.",
-    )
     return p.parse_args()
 
 
@@ -268,5 +258,4 @@ if __name__ == "__main__":
         symbols=args.symbols,
         period=args.period,
         interval=args.interval,
-        overwrite=args.overwrite,
     )
