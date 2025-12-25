@@ -12,6 +12,12 @@ try:
 except ModuleNotFoundError:  # pragma: no cover
     from project_purple.risk import RiskConfig, calculate_risk_for_trade, calculate_R
 
+# Same dual-import pattern for the canonical data directory resolver.
+try:
+    from data_loader import get_data_dir as _get_data_dir
+except ModuleNotFoundError:  # pragma: no cover
+    from project_purple.data_loader import get_data_dir as _get_data_dir
+
 
 SLIPPAGE_PCT = 0.001
 
@@ -491,40 +497,22 @@ def analyze_combined_trades(combined_trades: pd.DataFrame) -> None:
 
 def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
     """
-    Project Purple is locked to ONE canonical data directory:
+    Canonical data directory lock (single source of truth):
+      - Delegates to project_purple.data_loader.get_data_dir()
 
-        <repo_root>/data
+    Guarantees:
+      - ALWAYS returns <repo_root>/data
+      - HARD FAILS if <repo_root>/project_purple/data exists (legacy forbidden)
 
-    Safety gate:
-      - If <repo_root>/project_purple/data exists, HARD FAIL.
-        That legacy folder caused path ambiguity and corrupted OHLCV.
-
-    Note:
-      - We DO NOT auto-create folders here. If ./data is missing,
-        that's a setup problem (run the downloader / create the folder intentionally).
+    Additional safety:
+      - If caller passes data_dir, it MUST equal the canonical path.
+      - If caller passes project_root, it must align with canonical repo root.
     """
-    repo_root = Path(__file__).resolve().parents[1]
-    canonical = (repo_root / "data").resolve()
-    legacy_bad = (repo_root / "project_purple" / "data").resolve()
-
-    # Hard gate: forbidden legacy folder must never exist.
-    if legacy_bad.exists():
-        raise RuntimeError(
-            "Unsafe legacy data directory detected (MUST NOT EXIST):\n"
-            f"  {legacy_bad}\n\n"
-            "Project Purple is locked to ONE canonical data folder:\n"
-            f"  {canonical}\n\n"
-            "Fix (PowerShell):\n"
-            f'  Remove-Item -Recurse -Force "{legacy_bad}"\n'
-        )
+    canonical = Path(_get_data_dir()).resolve()
 
     # If caller passed an explicit data_dir, it must be canonical.
     if data_dir is not None:
         requested = Path(data_dir).resolve()
-        if requested == legacy_bad:
-            raise RuntimeError(
-                f"Refusing to use forbidden legacy data dir:\n  {requested}\n"
-            )
         if requested != canonical:
             raise RuntimeError(
                 "Project Purple is locked to ONE canonical data folder:\n"
@@ -533,12 +521,14 @@ def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
                 f"  {requested}\n\n"
                 "Fix: pass no data_dir (recommended) or pass the canonical ./data path."
             )
-        return canonical
 
-    # If caller passed project_root, still enforce canonical.
+    # If caller passed project_root, ensure it aligns (prevents accidental alternate repos).
     if project_root is not None:
         pr = Path(project_root).resolve()
+        pr_data = (pr / "data").resolve()
         pr_legacy = (pr / "project_purple" / "data").resolve()
+
+        # Extra guard: if caller points at a tree containing legacy folder, fail.
         if pr_legacy.exists():
             raise RuntimeError(
                 "Unsafe legacy data directory detected via project_root (MUST NOT EXIST):\n"
@@ -547,28 +537,16 @@ def _resolve_data_dir(data_dir: Path | None, project_root: Path | None) -> Path:
                 f'  Remove-Item -Recurse -Force "{pr_legacy}"\n'
             )
 
-        pr_data = (pr / "data").resolve()
-        if pr_data.exists():
-            if pr_data != canonical:
-                raise RuntimeError(
-                    "Project Purple is locked to ONE canonical data folder:\n"
-                    f"  {canonical}\n\n"
-                    "But project_root/data resolved to:\n"
-                    f"  {pr_data}\n\n"
-                    "Fix: run from the repo root, or don’t pass project_root."
-                )
-            return canonical
+        if pr_data.exists() and pr_data != canonical:
+            raise RuntimeError(
+                "Project Purple is locked to ONE canonical data folder:\n"
+                f"  {canonical}\n\n"
+                "But project_root/data resolved to:\n"
+                f"  {pr_data}\n\n"
+                "Fix: run from the repo root, or don’t pass project_root."
+            )
 
-    if canonical.exists():
-        return canonical
-
-    raise RuntimeError(
-        "Canonical data directory not found:\n"
-        f"  {canonical}\n\n"
-        "Fix:\n"
-        "  1) Create ./data at the repo root\n"
-        "  2) Download data (run your downloader)\n"
-    )
+    return canonical
 
 
 def run_backtest_for_symbol(

@@ -44,6 +44,10 @@ def apply_portfolio_policy_A(
     POLICY A (one position at a time):
       - On each entry_date, pick the trade with the highest entry_score (if available).
       - Only take a new trade after the previous trade has exited.
+      - IMPORTANT GUARD: block same-day re-entry at the open by requiring:
+            next entry_date must be STRICTLY AFTER previous exit_date
+        (Because we store dates at midnight, same-day entry/exit must be treated as overlap.)
+
       - Update equity using R-multiple and fixed risk_per_trade_pct.
 
     Assumptions:
@@ -89,13 +93,14 @@ def apply_portfolio_policy_A(
 
     day_best = day_best.sort_values("entry_date").reset_index(drop=True)
 
-    # Enforce "one position at a time"
+    # Enforce "one position at a time" (STRICT: no same-day re-entry)
     taken_rows = []
     next_free_date = pd.Timestamp.min
     for _, row in day_best.iterrows():
-        if row["entry_date"] >= next_free_date:
+        # STRICTLY AFTER to prevent same-day re-entry at the open
+        if row["entry_date"] > next_free_date:
             taken_rows.append(row)
-            # next trade can only start after this one exits
+            # next trade must start AFTER this exit day
             next_free_date = row["exit_date"]
 
     taken = pd.DataFrame(taken_rows)
