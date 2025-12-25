@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Dict, List, Tuple
 
+import numpy as np
 import pandas as pd
 from pandas.api.types import is_datetime64_any_dtype
 
@@ -184,6 +185,11 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
     for c in ["open", "high", "low", "close"]:
         if df[c].isna().any():
             raise ValueError(f"[{symbol}] Validation failed: {c} has NaN")
+
+        # NEW (Codex hardening): reject inf/-inf and other non-finite values
+        if not np.isfinite(df[c].to_numpy()).all():
+            raise ValueError(f"[{symbol}] Validation failed: {c} has non-finite values (inf/-inf)")
+
         if (df[c] <= 0).any():
             bad = df.loc[df[c] <= 0, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
             raise ValueError(f"[{symbol}] Validation failed: {c} <= 0 (examples: {bad})")
@@ -205,10 +211,15 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
         bad = df.loc[bad_close, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
         raise ValueError(f"[{symbol}] Validation failed: close outside [low, high] (examples: {bad})")
 
-    # Volume must be numeric and >= 0
+    # Volume must be numeric, finite, and >= 0
     vol = pd.to_numeric(df["volume"], errors="coerce")
     if vol.isna().any():
         raise ValueError(f"[{symbol}] Validation failed: volume has NaN/non-numeric")
+
+    # NEW (Codex hardening): reject inf/-inf and other non-finite values
+    if not np.isfinite(vol.to_numpy()).all():
+        raise ValueError(f"[{symbol}] Validation failed: volume has non-finite values (inf/-inf)")
+
     if (vol < 0).any():
         bad = df.loc[vol < 0, ["date", "volume"]].head(10).to_dict(orient="records")
         raise ValueError(f"[{symbol}] Validation failed: volume < 0 (examples: {bad})")
