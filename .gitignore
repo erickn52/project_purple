@@ -58,3 +58,6 @@ venv/
 
 # Generated market data (do not version)
 project_purple/data/*.csv
+
+# NEVER use package data dir (legacy / corrupted)
+project_purple/data/
