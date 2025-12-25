@@ -110,18 +110,15 @@ class UniverseMember:
     edge_fail_reason: str = ""
 
 
+# ---------------------------------------------------------------------------
+# Critical Item #3 hardening:
+# - normalize as_of_date to tz-naive midnight
+# - normalize df["date"] to tz-naive midnight before comparison
+# This prevents lookahead bias bugs caused by tz-aware vs tz-naive comparisons
+# and avoids off-by-one day issues when users pass timezone timestamps.
+# ---------------------------------------------------------------------------
+
 def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]]) -> Optional[pd.Timestamp]:
-    """
-    Normalize an as_of_date into a single canonical form:
-
-      - tz-naive Timestamp
-      - normalized to midnight
-
-    This prevents lookahead/cutoff bugs when:
-      - as_of_date is tz-aware (e.g. "2023-12-29T00:00:00-05:00")
-      - data has mixed tz strings
-      - pandas would otherwise throw tz-aware vs tz-naive comparison errors
-    """
     if as_of_date is None:
         return None
 
@@ -129,25 +126,20 @@ def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]]) -> Opt
     if pd.isna(ts):
         raise ValueError(f"Invalid as_of_date: {as_of_date!r}")
 
-    # Convert to tz-naive and normalize to date-only semantics
+    # Convert to tz-naive and normalize to midnight (daily-bar semantics)
     ts = ts.tz_convert(None).normalize()
     return ts
 
 
 def _apply_as_of_cutoff(df: pd.DataFrame, as_of_date: Optional[Union[str, pd.Timestamp]]) -> pd.DataFrame:
-    """
-    Apply an inclusive cutoff:
-        keep rows where date <= as_of_date
-
-    Dates are coerced to tz-naive midnight before filtering to avoid tz bugs.
-    """
     ts = _normalize_as_of_date(as_of_date)
     if ts is None:
         return df
 
     df = df.copy()
 
-    # Canonicalize df["date"] to tz-naive midnight
+    # Normalize df["date"] the same way we normalize as_of_date (tz-safe, midnight)
+    # so comparisons always work and always mean "date-only".
     dt = pd.to_datetime(df["date"], errors="coerce", utc=True)
     dt = dt.dt.tz_convert(None).dt.normalize()
     df["date"] = dt
@@ -223,7 +215,6 @@ def _edge_score(avg_R: float, profit_factor: float, win_rate_pct: float, max_dd_
 def _run_edge_backtest(symbol: str, risk_config: RiskConfig, as_of_date: Optional[Union[str, pd.Timestamp]]) -> pd.DataFrame:
     ts = _normalize_as_of_date(as_of_date)
 
-    # LIVE mode: no cutoff, run the normal per-symbol helper (full history).
     if ts is None:
         f = io.StringIO()
         with contextlib.redirect_stdout(f):
@@ -237,7 +228,6 @@ def _run_edge_backtest(symbol: str, risk_config: RiskConfig, as_of_date: Optiona
             )
         return trades_df
 
-    # HISTORICAL mode: apply cutoff to prevent lookahead bias.
     df = load_symbol_daily(symbol)
     if df.empty:
         return pd.DataFrame()
@@ -285,17 +275,12 @@ def evaluate_symbol(symbol: str, as_of_date: Optional[Union[str, pd.Timestamp]] 
     if df.empty:
         raise ValueError(f"No data for symbol {symbol}")
 
-    ts = _normalize_as_of_date(as_of_date)
-    df = _apply_as_of_cutoff(df, ts)
+    df = _apply_as_of_cutoff(df, as_of_date)
     if df.empty:
         raise ValueError(f"No usable rows for symbol {symbol} as of {as_of_date}")
 
     df = df.copy()
-
-    # Canonicalize date again (paranoia): tz-naive midnight
-    dt = pd.to_datetime(df["date"], errors="coerce", utc=True)
-    df["date"] = dt.dt.tz_convert(None).dt.normalize()
-
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
     if df.empty:
         raise ValueError(f"No usable rows for symbol {symbol}")
@@ -339,14 +324,11 @@ def evaluate_symbol(symbol: str, as_of_date: Optional[Union[str, pd.Timestamp]] 
 
 
 def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> List[str]:
-    # Normalize once so EVERY downstream comparison uses the same canonical cutoff.
-    as_of_ts = _normalize_as_of_date(as_of_date)
-
     market_regime = "UNKNOWN"
     risk_mult = 1.0
 
     try:
-        state = get_market_state(symbol="SPY", as_of_date=as_of_ts)
+        state = get_market_state(symbol="SPY", as_of_date=as_of_date)
         market_regime = state.regime
     except Exception as e:
         print("\nWARNING: Could not determine market regime from SPY.")
@@ -365,7 +347,7 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
     members: List[UniverseMember] = []
     for symbol in CANDIDATE_SYMBOLS:
         try:
-            members.append(evaluate_symbol(symbol, as_of_date=as_of_ts))
+            members.append(evaluate_symbol(symbol, as_of_date=as_of_date))
         except Exception as e:
             print(f"WARNING: could not evaluate {symbol}: {e}")
 
@@ -411,7 +393,7 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
 
     edge_rows = []
     for sym in included_symbols:
-        trades_df = _run_edge_backtest(sym, risk_config=risk_config, as_of_date=as_of_ts)
+        trades_df = _run_edge_backtest(sym, risk_config=risk_config, as_of_date=as_of_date)
 
         n_trades = int(len(trades_df))
         if n_trades == 0:
