@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import List
+from typing import List, Optional, Union
 
 import contextlib
 import io
@@ -9,7 +9,13 @@ import pandas as pd
 
 from data_loader import load_symbol_daily
 from market_state import get_market_state
-from backtest_v2 import run_backtest_for_symbol
+from backtest_v2 import (
+    run_backtest_for_symbol,
+    run_backtest,
+    add_atr,
+    add_momentum_pullback_signals,
+    validate_ohlcv_dataframe,
+)
 from risk import RiskConfig
 
 # ---------------------------------------------------------------------------
@@ -120,6 +126,32 @@ class UniverseMember:
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]]) -> Optional[pd.Timestamp]:
+    if as_of_date is None:
+        return None
+    ts = pd.to_datetime(as_of_date, errors="coerce")
+    if pd.isna(ts):
+        raise ValueError(f"Invalid as_of_date: {as_of_date!r}")
+    return ts
+
+
+def _slice_as_of(df: pd.DataFrame, as_of_date: Optional[pd.Timestamp]) -> pd.DataFrame:
+    """
+    Return df filtered to rows with date <= as_of_date (inclusive).
+    If as_of_date is None, return df unchanged.
+    """
+    if as_of_date is None:
+        return df
+    if "date" not in df.columns:
+        raise ValueError("Dataframe missing 'date' column (cannot apply as_of_date cutoff).")
+    d = df.copy()
+    d["date"] = pd.to_datetime(d["date"], errors="coerce")
+    d = d.dropna(subset=["date"]).copy()
+    d = d[d["date"] <= as_of_date].copy()
+    d = d.sort_values("date").reset_index(drop=True)
+    return d
+
+
 def _add_atr(df: pd.DataFrame, period: int = ATR_PERIOD) -> pd.Series:
     prev_close = df["close"].shift(1)
     tr1 = df["high"] - df["low"]
@@ -204,24 +236,70 @@ def _edge_score(
     return float(score)
 
 
-def _run_edge_backtest(symbol: str, risk_config: RiskConfig) -> pd.DataFrame:
+def _run_edge_backtest(
+    symbol: str,
+    risk_config: RiskConfig,
+    as_of_date: Optional[pd.Timestamp] = None,
+) -> pd.DataFrame:
     """
-    Runs the *real* backtest engine to measure whether the symbol responds
-    to the system's edge.
+    HR2 fix:
+    - If as_of_date is provided, the edge backtest MUST only use data <= as_of_date.
+      This prevents lookahead bias when reusing build_universe() for historical simulation.
+    - If as_of_date is None, keep current behavior (full-history edge test).
+    """
+    # Live / today behavior: keep existing full-history backtest, silence verbose output.
+    if as_of_date is None:
+        f = io.StringIO()
+        with contextlib.redirect_stdout(f):
+            trades_df, _final_equity = run_backtest_for_symbol(
+                symbol=symbol,
+                risk_config=risk_config,
+                initial_equity=EDGE_TEST_INITIAL_EQUITY,
+                max_hold_days=EDGE_TEST_MAX_HOLD_DAYS,
+                trail_atr_multiple=EDGE_TEST_TRAIL_ATR_MULTIPLE,
+                project_root=None,
+            )
+        return trades_df
 
-    We silence the verbose prints from backtest_v2 so the scanner output
-    stays readable.
-    """
-    f = io.StringIO()
-    with contextlib.redirect_stdout(f):
-        trades_df, _final_equity = run_backtest_for_symbol(
-            symbol=symbol,
-            risk_config=risk_config,
-            initial_equity=EDGE_TEST_INITIAL_EQUITY,
-            max_hold_days=EDGE_TEST_MAX_HOLD_DAYS,
-            trail_atr_multiple=EDGE_TEST_TRAIL_ATR_MULTIPLE,
-            project_root=None,
-        )
+    # Historical (as-of) behavior: build a truncated dataframe and run the core engine directly.
+    df = load_symbol_daily(symbol)
+    if df is None or df.empty:
+        return pd.DataFrame()
+
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = df.dropna(subset=["date", "open", "high", "low", "close"]).reset_index(drop=True)
+    df = df.sort_values("date").reset_index(drop=True)
+
+    df = _slice_as_of(df, as_of_date)
+    if df.empty:
+        return pd.DataFrame()
+
+    # Validate before indicators/backtest
+    try:
+        validate_ohlcv_dataframe(df=df, symbol=symbol)
+    except Exception:
+        return pd.DataFrame()
+
+    # Indicators + signal identical to backtest_v2 path
+    df = add_atr(df, period=ATR_PERIOD)
+    df = add_momentum_pullback_signals(df, ma_fast=MA_FAST, ma_slow=MA_SLOW)
+    df = df.dropna(subset=["atr", "ma_fast", "ma_slow"]).reset_index(drop=True)
+
+    if df.empty or len(df) < 5:
+        return pd.DataFrame()
+
+    trades_df, _final_equity = run_backtest(
+        df=df,
+        risk_config=risk_config,
+        initial_equity=EDGE_TEST_INITIAL_EQUITY,
+        max_hold_days=EDGE_TEST_MAX_HOLD_DAYS,
+        trail_atr_multiple=EDGE_TEST_TRAIL_ATR_MULTIPLE,
+    )
+
+    if not trades_df.empty:
+        trades_df["symbol"] = symbol
+
     return trades_df
 
 
@@ -229,18 +307,23 @@ def _run_edge_backtest(symbol: str, risk_config: RiskConfig) -> pd.DataFrame:
 # Core evaluation
 # ---------------------------------------------------------------------------
 
-def evaluate_symbol(symbol: str) -> UniverseMember:
+def evaluate_symbol(symbol: str, as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> UniverseMember:
+    as_of_ts = _normalize_as_of_date(as_of_date)
+
     df = load_symbol_daily(symbol)
     if df.empty:
         raise ValueError(f"No data for symbol {symbol}")
 
     df = df.copy()
-
-    # Make sure date is datetime for safety (load_symbol_daily should already do this)
     df["date"] = pd.to_datetime(df["date"], errors="coerce")
     df = df.dropna(subset=["date", "open", "high", "low", "close", "volume"]).reset_index(drop=True)
+    df = df.sort_values("date").reset_index(drop=True)
+
+    # HR2: apply as-of cutoff to prevent using future rows for fast screen too
+    df = _slice_as_of(df, as_of_ts)
+
     if df.empty:
-        raise ValueError(f"No usable rows for symbol {symbol}")
+        raise ValueError(f"No usable rows for symbol {symbol} as of {as_of_ts.date() if as_of_ts is not None else 'N/A'}")
 
     # Indicators (very lightweight)
     df["ma_fast"] = df["close"].rolling(MA_FAST).mean()
@@ -252,7 +335,7 @@ def evaluate_symbol(symbol: str) -> UniverseMember:
     last_close = float(last["close"])
     last_date = pd.to_datetime(last["date"])
 
-    # Liquidity filter over last window
+    # Liquidity filter over last window (as-of)
     vol_window = df["volume"].tail(VOLUME_LOOKBACK)
     avg_volume = float(vol_window.mean()) if len(vol_window) > 0 else np.nan
 
@@ -282,14 +365,20 @@ def evaluate_symbol(symbol: str) -> UniverseMember:
     )
 
 
-def build_universe() -> List[str]:
+def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> List[str]:
     """
     Build a tradeable universe in three passes:
 
     PASS 1 (fast): price + liquidity + simple trend/volatility score.
     PASS 2 (slow): edge-response filter (backtest the *actual* system per symbol).
     PASS 3 (regime-aware): in CHOPPY markets, keep only the best leaders and recommend 1/2 risk.
+
+    HR2 fix:
+      - If as_of_date is provided, ALL symbol evaluation and edge-testing is restricted to data <= as_of_date.
+        This prevents lookahead bias when using build_universe() for historical simulation.
     """
+    as_of_ts = _normalize_as_of_date(as_of_date)
+
     # --------------------------------------------------------
     # 0) Market regime (SPY)
     # --------------------------------------------------------
@@ -297,7 +386,11 @@ def build_universe() -> List[str]:
     risk_mult = 1.0
 
     try:
-        state = get_market_state(symbol="SPY")
+        # If get_market_state supports as_of_date, use it; otherwise fall back.
+        try:
+            state = get_market_state(symbol="SPY", as_of_date=as_of_ts)  # type: ignore[arg-type]
+        except TypeError:
+            state = get_market_state(symbol="SPY")
         market_regime = state.regime
     except Exception as e:
         print("\nWARNING: Could not determine market regime from SPY.")
@@ -319,7 +412,7 @@ def build_universe() -> List[str]:
     members: List[UniverseMember] = []
     for symbol in CANDIDATE_SYMBOLS:
         try:
-            members.append(evaluate_symbol(symbol))
+            members.append(evaluate_symbol(symbol, as_of_date=as_of_ts))
         except Exception as e:
             print(f"WARNING: could not evaluate {symbol}: {e}")
 
@@ -346,6 +439,8 @@ def build_universe() -> List[str]:
     df_print_fast["atr_pct"] = (df_print_fast["atr_pct"] * 100.0).round(2)
 
     print("\n=== PASS 1: Fast screen (price + liquidity + simple score) ===")
+    if as_of_ts is not None:
+        print(f"(as_of_date cutoff active: <= {as_of_ts.date()})")
     print(df_print_fast[[
         "symbol", "included", "last_close", "avg_volume", "score", "ret20", "atr_pct", "ma_fast", "ma_slow"
     ]].to_string(index=False))
@@ -371,7 +466,7 @@ def build_universe() -> List[str]:
 
     edge_rows = []
     for sym in included_symbols:
-        trades_df = _run_edge_backtest(sym, risk_config=risk_config)
+        trades_df = _run_edge_backtest(sym, risk_config=risk_config, as_of_date=as_of_ts)
 
         n_trades = int(len(trades_df))
         if n_trades == 0:
@@ -386,7 +481,11 @@ def build_universe() -> List[str]:
             win_rate = float((trades_df["pnl_dollars"] > 0).mean() * 100.0)
             avg_R = float(trades_df["R"].mean())
             pf = _profit_factor(trades_df["pnl_dollars"])
-            equity_curve = pd.concat([pd.Series([EDGE_TEST_INITIAL_EQUITY]), trades_df["equity_after"].reset_index(drop=True)], ignore_index=True)
+            equity_curve = pd.concat(
+                [pd.Series([EDGE_TEST_INITIAL_EQUITY]),
+                 trades_df["equity_after"].reset_index(drop=True)],
+                ignore_index=True,
+            )
             max_dd = _max_drawdown_pct(equity_curve)  # negative
             score = _edge_score(avg_R=avg_R, profit_factor=pf, win_rate_pct=win_rate, max_dd_pct=max_dd, n_trades=n_trades)
 
@@ -426,7 +525,6 @@ def build_universe() -> List[str]:
 
     # FIX: avoid pandas FutureWarning by converting dtype BEFORE fillna
     df2["edge_pass"] = df2["edge_pass"].astype("boolean").fillna(False).astype(bool)
-
     df2["edge_fail_reason"] = df2["edge_fail_reason"].fillna("not_tested")
 
     df_print_edge = df2.copy()
@@ -448,8 +546,8 @@ def build_universe() -> List[str]:
     if market_regime == "CHOPPY":
         print(f"\n=== MARKET REGIME: {YELLOW}CHOPPY{RESET} ===")
         print("Rules:")
-        print(f"  - Keep only edge-pass symbols")
-        print(f"  - Stricter selection: ret20 > 0 AND ma_fast > ma_slow")
+        print("  - Keep only edge-pass symbols")
+        print("  - Stricter selection: ret20 > 0 AND ma_fast > ma_slow")
         print(f"  - Keep top {CHOPPY_MAX_UNIVERSE} by edge_score")
         print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%} (1/2 of normal)")
 
@@ -463,7 +561,6 @@ def build_universe() -> List[str]:
         df_final = df_final.sort_values(by="edge_score", ascending=False).head(CHOPPY_MAX_UNIVERSE)
 
     else:
-        # BULL (or unknown): still require edge-pass, but allow a wider list.
         regime_str = f"{GREEN}BULL{RESET}" if market_regime == "BULL" else f"{YELLOW}{market_regime}{RESET}"
         print(f"\n=== MARKET REGIME: {regime_str} ===")
         print("Rules:")
