@@ -12,7 +12,7 @@ Execution to Interactive Brokers (paper) is **planned**, but **not yet wired for
 
 ---
 
-## What it does today (current state as of December 23, 2025)
+## What it does today (current state as of December 24, 2025)
 
 When you run the main entrypoint, Project Purple:
 
@@ -40,12 +40,29 @@ When you run the main entrypoint, Project Purple:
 
 ---
 
+## Canonical data location (IMPORTANT)
+
+**All market data CSVs live in the repo-root `./data/` folder (Option A).**
+
+✅ Correct:
+- `./data/SPY_daily.csv`
+- `./data/AAPL_daily.csv`
+- `./data/<SYMBOL>_daily.csv`
+
+🚫 Not used (and should not exist):
+- `./project_purple/data/`
+
+This project previously suffered from confusing duplicate data folders. The codebase is being locked to **repo-root `./data/` only** to prevent corrupted/shifted OHLCV data and path ambiguity.
+
+---
+
 ## Repository layout (important files)
 
 Top-level:
 - `run_project_purple.py` — **recommended launcher** (works around current import style)
 - `requirements.txt` — python deps
-- `.env` — IB connection defaults (host/port/client_id)
+- `.env` — IB connection defaults (host/port/client_id) *(not tracked)*
+- `data/` — **canonical daily OHLCV CSVs** (`*_daily.csv`)
 - `project_purple/` — Python package
 
 Package:
@@ -55,13 +72,13 @@ Package:
 - `project_purple/risk.py` — ATR stop/target + position sizing + R-multiple
 - `project_purple/market_state.py` — regime classification (SPY)
 - `project_purple/trade_plan.py` — prints a “today trade plan” style report (no order placement)
-- `project_purple/data_loader.py` — loads per-symbol daily CSVs
-- `project_purple/data_downloader.py` — downloads daily bars via yfinance into `project_purple/data/`
+- `project_purple/data_loader.py` — loads per-symbol daily CSVs from **repo-root `./data/`**
+- `project_purple/data_downloader.py` — downloads daily bars via yfinance into **repo-root `./data/`**
 - `project_purple/ib_client.py` — IBKR historical data loader (ib_insync)
 - `project_purple/archive/` — older experiments (not used by the main run)
 
-Data:
-- `project_purple/data/*_daily.csv` — daily OHLCV files used by the loader
+Data (canonical):
+- `data/*_daily.csv` — daily OHLCV files used by the loader
 
 ---
 
@@ -89,12 +106,23 @@ Activate it:
 pip install -r requirements.txt
 ```
 
-### 3) Ensure you have data
-This repo already contains many CSVs in `project_purple/data/`.
+### 3) Ensure you have data (repo-root `./data`)
+You need at minimum:
+- `data/SPY_daily.csv`
 
-If you want to refresh/expand data via yfinance:
-```bash
-python -c "from project_purple.data_downloader import download_and_save_daily_data; download_and_save_daily_data()"
+Optional: download/refresh data via yfinance using the downloader.
+
+**Safe default (does NOT overwrite existing `*_daily.csv`):**
+```powershell
+python -u .\project_purple\data_downloader.py --symbols SPY
+```
+
+If `data/SPY_daily.csv` already exists, the downloader will write a timestamped file like:
+- `data/SPY_daily.download_YYYYMMDD_HHMMSS.csv`
+
+**Overwrite existing files (use with care):**
+```powershell
+python -u .\project_purple\data_downloader.py --symbols SPY --overwrite
 ```
 
 ### 4) Run the system (recommended)
@@ -144,14 +172,13 @@ Before paper trading, you still need:
 
 ## How we should use Codex to keep the code clean (recommended workflow)
 
-Codex is best used as a **repo-aware coding agent** that can edit files, run commands, and propose changes. citeturn0search5turn0search6turn0search12
+Codex is best used as a repo-aware coding agent to propose small, reviewable diffs.
 
-**The best way to use Codex on Project Purple is to enforce your rule: _one change, one file, one test_.**
+**Rule for this repo:** _one change, one file, one test._
 
-Suggested Codex workflow:
-
-1) Create a small “task spec” (what + why + acceptance test).
-2) Tell Codex: “Change **only one file** and **run one test command**.”
+Suggested workflow:
+1) Write a tiny task spec (what + why + acceptance test).
+2) Tell Codex: “Change **only one file** and run **one** test command.”
 3) Review the diff, then merge.
 
 High-impact Codex tasks for this repo:
@@ -160,8 +187,6 @@ High-impact Codex tasks for this repo:
 - **Execution module:** implement IB paper bracket orders behind a `--dry-run` flag.
 - **Logging:** add a structured daily log (decisions + orders + fills).
 - **Linting/typing:** add Ruff + MyPy and fix the easy wins.
-
-If you use Codex cloud: ask it to propose a PR-style change and run `python run_project_purple.py` as the acceptance test. citeturn0search0turn0search8
 
 ---
 
