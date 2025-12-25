@@ -51,7 +51,6 @@ def get_data_dir() -> Path:
             "  2) Re-run the system.\n"
         )
 
-    # Ensure canonical exists (but do not create legacy folders).
     canonical.mkdir(parents=True, exist_ok=True)
     return canonical
 
@@ -89,8 +88,8 @@ def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    # Drop rows with missing price data
-    df = df.dropna(subset=["open", "high", "low", "close"]).copy()
+    # Drop rows with missing OHLC (volume can be NaN in some feeds, but we want it too)
+    df = df.dropna(subset=["open", "high", "low", "close", "volume"]).copy()
 
     # Ensure expected column order
     expected_cols = ["date", "symbol", "open", "high", "low", "close", "volume"]
@@ -104,6 +103,64 @@ def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
     )
 
     return df
+
+
+def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
+    """
+    Strict OHLCV validation for downstream consumers.
+    Ensures we do not silently operate on corrupted data.
+    """
+    required = {"date", "open", "high", "low", "close", "volume"}
+    missing = required - set(df.columns)
+    if missing:
+        raise ValueError(f"[{symbol}] Validation failed: missing columns {sorted(missing)}")
+
+    if df.empty:
+        raise ValueError(f"[{symbol}] Validation failed: dataframe is empty")
+
+    if df["date"].isna().any():
+        raise ValueError(f"[{symbol}] Validation failed: date contains NaT/NaN")
+
+    if not df["date"].is_monotonic_increasing:
+        raise ValueError(f"[{symbol}] Validation failed: dates not sorted ascending")
+
+    dupes = df["date"].duplicated()
+    if dupes.any():
+        examples = df.loc[dupes, ["date"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: duplicate dates (examples: {examples})")
+
+    # OHLC must be numeric, finite, and > 0
+    for c in ["open", "high", "low", "close"]:
+        if df[c].isna().any():
+            raise ValueError(f"[{symbol}] Validation failed: {c} has NaN")
+        if (df[c] <= 0).any():
+            bad = df.loc[df[c] <= 0, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+            raise ValueError(f"[{symbol}] Validation failed: {c} <= 0 (examples: {bad})")
+
+    # high >= low
+    bad_hl = df["high"] < df["low"]
+    if bad_hl.any():
+        bad = df.loc[bad_hl, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: high < low (examples: {bad})")
+
+    # open/close must be within [low, high]
+    bad_open = (df["open"] < df["low"]) | (df["open"] > df["high"])
+    if bad_open.any():
+        bad = df.loc[bad_open, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: open outside [low, high] (examples: {bad})")
+
+    bad_close = (df["close"] < df["low"]) | (df["close"] > df["high"])
+    if bad_close.any():
+        bad = df.loc[bad_close, ["date", "open", "high", "low", "close"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: close outside [low, high] (examples: {bad})")
+
+    # Volume must be numeric and >= 0
+    vol = pd.to_numeric(df["volume"], errors="coerce")
+    if vol.isna().any():
+        raise ValueError(f"[{symbol}] Validation failed: volume has NaN/non-numeric")
+    if (vol < 0).any():
+        bad = df.loc[vol < 0, ["date", "volume"]].head(10).to_dict(orient="records")
+        raise ValueError(f"[{symbol}] Validation failed: volume < 0 (examples: {bad})")
 
 
 def load_symbol_daily(symbol: str) -> pd.DataFrame:
@@ -128,6 +185,7 @@ def load_symbol_daily(symbol: str) -> pd.DataFrame:
 
     raw = pd.read_csv(csv_path)
     df = _clean_daily_csv(raw=raw, symbol=symbol)
+    _validate_ohlcv_dataframe(df=df, symbol=symbol)
     return df
 
 
@@ -160,6 +218,8 @@ if __name__ == "__main__":
         print("\nSPY head:")
         print(spy_df.head())
         print(f"\nSPY rows: {len(spy_df)}")
+        print("\nSPY tail:")
+        print(spy_df.tail(3)[["date", "close"]])
 
     except Exception as e:
         print(f"Error while loading data: {e}")
