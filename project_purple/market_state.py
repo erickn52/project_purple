@@ -1,3 +1,5 @@
+# project_purple/market_state.py
+
 from dataclasses import dataclass
 from typing import Optional, Union
 
@@ -7,19 +9,22 @@ import pandas as pd
 
 from data_loader import load_symbol_daily
 
+# Centralized regime policy (single source of truth).
+# Support running both:
+# - from inside project_purple/: python market_state.py
+# - from repo root with sys.path tweaks / module import
+try:
+    from regime_risk import get_regime_policy
+except ModuleNotFoundError:  # pragma: no cover
+    from project_purple.regime_risk import get_regime_policy
+
+
 # Basic parameters for regime detection
 REGIME_FAST_MA = 50
 REGIME_SLOW_MA = 200
 REGIME_ATR_WINDOW = 14
 
 MARKET_SYMBOL = "SPY"  # we can parameterize later if needed
-
-# Risk multipliers by regime (applies to base risk_per_trade_pct in main.py)
-RISK_MULTIPLIER_BY_REGIME = {
-    "BULL": 1.00,
-    "CHOPPY": 0.50,
-    "BEAR": 0.00,
-}
 
 # Console colors
 GREEN = "\033[92m"
@@ -41,8 +46,12 @@ class MarketState:
 
     @property
     def trade_long(self) -> bool:
-        """Allowed in BULL or CHOPPY, blocked in BEAR."""
-        return self.regime != "BEAR"
+        """
+        Allowed in BULL or CHOPPY, blocked in BEAR.
+
+        Delegates to regime_risk.py (single source of truth).
+        """
+        return bool(get_regime_policy(self.regime).trade_long)
 
     @property
     def market_long_ok(self) -> bool:
@@ -51,8 +60,12 @@ class MarketState:
 
     @property
     def risk_multiplier(self) -> float:
-        """Multiplier applied to base risk per trade based on market regime."""
-        return float(RISK_MULTIPLIER_BY_REGIME.get(self.regime, 0.00))
+        """
+        Multiplier applied to base risk per trade based on market regime.
+
+        Delegates to regime_risk.py (single source of truth).
+        """
+        return float(get_regime_policy(self.regime).risk_multiplier)
 
 
 def _compute_atr(df: pd.DataFrame, window: int) -> pd.Series:
