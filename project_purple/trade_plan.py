@@ -10,36 +10,21 @@ from pathlib import Path
 
 import pandas as pd
 
-# IMPORTANT:
-# This module is often imported as: from project_purple.trade_plan import build_trade_plan
-# When imported that way, absolute imports like "from scanner_simple import ..." fail
-# because scanner_simple is inside the project_purple package.
-# So we prefer package-relative imports, with a fallback for running from within the
-# package directory (or with sys.path tweaks).
+# Prefer package-relative imports, with a fallback for direct script execution.
 try:
-    from .scanner_simple import build_universe
     from .market_state import get_market_state
-    from .data_loader import load_symbol_daily
-    from .risk import RiskConfig, calculate_risk_for_trade
-    from .backtest_v2 import SLIPPAGE_PCT, add_atr, add_momentum_pullback_signals
-except ImportError:  # pragma: no cover
-    from scanner_simple import build_universe
-    from market_state import get_market_state
-    from data_loader import load_symbol_daily
-    from risk import RiskConfig, calculate_risk_for_trade
-    from backtest_v2 import SLIPPAGE_PCT, add_atr, add_momentum_pullback_signals
-
-# Centralized regime policy (single source of truth).
-try:
     from .regime_risk import get_regime_policy
+    from .scanner_simple import build_universe
+    from .data_loader import load_symbol_daily
+    from .backtest_v2 import SLIPPAGE_PCT, add_atr, add_momentum_pullback_signals
+    from .risk import RiskConfig, calculate_risk_for_trade
 except ImportError:  # pragma: no cover
-    try:
-        from regime_risk import get_regime_policy
-    except ModuleNotFoundError:  # pragma: no cover
-        from project_purple.regime_risk import get_regime_policy
-
-
-BASE_RISK_PER_TRADE_PCT = 0.01  # will be scaled by regime risk multiplier
+    from market_state import get_market_state
+    from regime_risk import get_regime_policy
+    from scanner_simple import build_universe
+    from data_loader import load_symbol_daily
+    from backtest_v2 import SLIPPAGE_PCT, add_atr, add_momentum_pullback_signals
+    from risk import RiskConfig, calculate_risk_for_trade
 
 
 def _ensure_logs_dir() -> Path:
@@ -97,23 +82,56 @@ def build_trade_plan(
     return_meta: bool = False,
 ) -> Optional[dict]:
     """
-    Build a daily swing trade plan (Policy A: 1 position at a time; long-only).
+    Build a daily swing trade plan (long-only).
 
-    IMPORTANT:
-    - This function does NOT print. It returns data only.
-    - If return_meta=False (default): returns plan dict on success else None.
-    - If return_meta=True: returns a dict ALWAYS (status + fields), even if blocked.
-
-    Notes:
-      - Risk per trade is BASE_RISK_PER_TRADE_PCT scaled by regime_risk multiplier.
-      - as_of_date is forwarded to regime + scanner to avoid lookahead bias.
+    - Does NOT print; returns structured data.
+    - If return_meta=True: always returns a dict with status + details.
+    - If return_meta=False: returns plan dict on success else None.
     """
     now_utc = datetime.now(timezone.utc).isoformat()
 
-    # ---- 1) Market state ----
-    state = get_market_state(as_of_date=as_of_date)
+    # ---- 1) Market state (defensive) ----
+    try:
+        state = get_market_state(as_of_date=as_of_date)
+    except Exception as e:
+        meta: dict = {
+            "status": "market_state_error",
+            "timestamp_utc": now_utc,
+            "as_of_input": as_of_date,
+            "regime": "UNKNOWN",
+            "trade_long_allowed": False,
+            "risk_multiplier": 0.0,
+            "policy_error": "",
+            "symbol": "",
+            "as_of_date": None,
+            "risk_config": None,
+            "entry_price": None,
+            "stop_price": None,
+            "target_price": None,
+            "shares": None,
+            "dollars_at_risk": None,
+            "note": "market_state_error",
+            "market_state_error": str(e),
+        }
+        _append_trade_journal_row(
+            {
+                "timestamp_utc": now_utc,
+                "as_of_date": str(as_of_date) if as_of_date is not None else "",
+                "regime": "UNKNOWN",
+                "trade_long_allowed": False,
+                "risk_multiplier": 0.0,
+                "symbol": "",
+                "entry_price": "",
+                "stop_price": "",
+                "target_price": "",
+                "shares": "",
+                "dollars_at_risk": "",
+                "note": "market_state_error",
+            }
+        )
+        return meta if return_meta else None
 
-    # Centralized regime rules (single source of truth)
+    # Centralized regime policy
     try:
         policy = get_regime_policy(state.regime)
         risk_mult = float(policy.risk_multiplier)
@@ -132,7 +150,6 @@ def build_trade_plan(
         "trade_long_allowed": trade_long_allowed,
         "risk_multiplier": risk_mult,
         "policy_error": policy_error,
-        # Plan fields (default empty)
         "symbol": "",
         "as_of_date": None,
         "risk_config": None,
@@ -144,7 +161,6 @@ def build_trade_plan(
         "note": "",
     }
 
-    # If policy resolution failed, treat it as blocked (defensive)
     if policy_error:
         meta["status"] = "blocked_policy_error"
         meta["note"] = "blocked_policy_error"
@@ -187,7 +203,7 @@ def build_trade_plan(
         )
         return meta if return_meta else None
 
-    # ---- 2) Universe / pick top symbol ----
+    # ---- 2) Universe selection ----
     universe = build_universe(as_of_date=as_of_date)
     if not universe:
         meta["status"] = "empty_universe"
@@ -213,15 +229,13 @@ def build_trade_plan(
     symbol = universe[0]
     meta["symbol"] = symbol
 
-    # ---- 3) Load data & compute indicators ----
+    # ---- 3) Load symbol + indicators ----
     df = load_symbol_daily(symbol, as_of_date=as_of_date)
-    df = df.sort_values("date").reset_index(drop=True)
+    df = add_atr(df)
+    df = add_momentum_pullback_signals(df)
 
-    df = add_atr(df, period=14)
-    df = add_momentum_pullback_signals(df, ma_fast=20, ma_slow=50)
-    df = df.dropna(subset=["atr", "ma_fast", "ma_slow"]).reset_index(drop=True)
-
-    if df.empty:
+    usable = df.dropna(subset=["close", "atr"])
+    if usable.empty:
         meta["status"] = "no_usable_rows_after_indicators"
         meta["note"] = "no_usable_rows_after_indicators"
         _append_trade_journal_row(
@@ -242,11 +256,46 @@ def build_trade_plan(
         )
         return meta if return_meta else None
 
-    last = df.iloc[-1]
+    last = usable.iloc[-1]
+
+    # ---- 3.5) ENTRY SIGNAL ENFORCEMENT (Step 2) ----
+    # Only plan a trade when today's signal says "on".
+    sig_val = last.get("signal") if isinstance(last, pd.Series) else None
+    try:
+        sig_int = int(sig_val) if sig_val is not None and not pd.isna(sig_val) else 0
+    except Exception:
+        sig_int = 0
+
+    if sig_int != 1:
+        meta["status"] = "signal_off"
+        meta["note"] = "signal_off"
+        meta["as_of_date"] = pd.to_datetime(last.get("date")) if "date" in last else None
+
+        _append_trade_journal_row(
+            {
+                "timestamp_utc": now_utc,
+                "as_of_date": str(as_of_date) if as_of_date is not None else "",
+                "regime": state.regime,
+                "trade_long_allowed": trade_long_allowed,
+                "risk_multiplier": risk_mult,
+                "symbol": symbol,
+                "entry_price": "",
+                "stop_price": "",
+                "target_price": "",
+                "shares": "",
+                "dollars_at_risk": "",
+                "note": "signal_off",
+            }
+        )
+        return meta if return_meta else None
+
+    # ---- 4) Risk config + sizing ----
     close = float(last["close"])
     atr = float(last["atr"])
 
-    # ---- 4) Risk config + sizing ----
+    BASE_RISK_PER_TRADE_PCT = 0.0075  # 0.75% baseline (we'll centralize later)
+
+    # IMPORTANT: use only fields that exist in RiskConfig (per risk.py)
     risk_config = RiskConfig(
         risk_per_trade_pct=BASE_RISK_PER_TRADE_PCT * risk_mult,
         atr_stop_multiple=1.5,
@@ -272,7 +321,7 @@ def build_trade_plan(
         {
             "status": "planned",
             "note": "planned",
-            "as_of_date": pd.to_datetime(last["date"]),
+            "as_of_date": pd.to_datetime(last["date"]) if "date" in last else None,
             "risk_config": risk_config,
             "entry_price": float(entry_price) if entry_price is not None else None,
             "stop_price": float(stop_price) if stop_price is not None else None,
@@ -295,11 +344,10 @@ def build_trade_plan(
             "target_price": meta["target_price"] if meta["target_price"] is not None else "",
             "shares": shares if shares is not None else "",
             "dollars_at_risk": dollars_at_risk if dollars_at_risk is not None else "",
-            "note": "planned",
+            "note": meta.get("note", ""),
         }
     )
 
-    # Backward-compatible behavior:
     return meta if return_meta else {
         "symbol": symbol,
         "as_of_date": meta["as_of_date"],
