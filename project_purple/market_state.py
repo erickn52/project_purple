@@ -1,22 +1,32 @@
 # project_purple/market_state.py
 
+from __future__ import annotations
+
 from dataclasses import dataclass
 from typing import Optional, Union
 
 import sys
+
 import numpy as np
 import pandas as pd
 
-from data_loader import load_symbol_daily
+# Internal imports: support package import (project_purple.market_state) and script runs.
+try:
+    from .data_loader import load_symbol_daily
+except ImportError:  # pragma: no cover
+    try:
+        from data_loader import load_symbol_daily
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.data_loader import load_symbol_daily
 
 # Centralized regime policy (single source of truth).
-# Support running both:
-# - from inside project_purple/: python market_state.py
-# - from repo root with sys.path tweaks / module import
 try:
-    from regime_risk import get_regime_policy
-except ModuleNotFoundError:  # pragma: no cover
-    from project_purple.regime_risk import get_regime_policy
+    from .regime_risk import get_regime_policy
+except ImportError:  # pragma: no cover
+    try:
+        from regime_risk import get_regime_policy
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.regime_risk import get_regime_policy
 
 
 # Basic parameters for regime detection
@@ -36,9 +46,10 @@ RESET = "\033[0m"
 @dataclass
 class MarketState:
     """Represents the high-level state of the overall market."""
+
     symbol: str
     as_of_date: pd.Timestamp
-    regime: str          # "BULL", "BEAR", "CHOPPY"
+    regime: str  # "BULL", "BEAR", "CHOPPY"
     close: float
     ma_fast: float
     ma_slow: float
@@ -102,8 +113,11 @@ def get_market_state(
     HR2:
       - If as_of_date is provided, we ONLY use rows with date <= as_of_date.
         This prevents lookahead bias in historical simulation.
+
+    NOTE: load_symbol_daily() is responsible for applying the inclusive cutoff.
     """
-    df = load_symbol_daily(symbol)
+
+    df = load_symbol_daily(symbol, as_of_date=as_of_date)
     if df.empty:
         raise ValueError(f"No data loaded for symbol {symbol}")
 
@@ -114,24 +128,14 @@ def get_market_state(
     df = df.dropna(subset=["date", "open", "high", "low", "close"]).copy()
     df = df.sort_values("date").reset_index(drop=True)
 
-    # Apply as-of cutoff (inclusive)
-    as_of_ts = _normalize_as_of_date(as_of_date)
-    if as_of_ts is not None:
-        df = df[df["date"] <= as_of_ts].copy()
-        df = df.sort_values("date").reset_index(drop=True)
+    # Data loader already applies as_of_date cutoff (inclusive) when provided.
 
     if df.empty:
-        raise ValueError(
-            f"No usable rows for symbol {symbol} as of {as_of_ts.date() if as_of_ts is not None else 'N/A'}"
-        )
+        raise ValueError(f"No usable rows for symbol {symbol} as of {as_of_date!r}")
 
     # Indicators
-    df["ma_fast"] = df["close"].rolling(
-        window=REGIME_FAST_MA, min_periods=REGIME_FAST_MA
-    ).mean()
-    df["ma_slow"] = df["close"].rolling(
-        window=REGIME_SLOW_MA, min_periods=REGIME_SLOW_MA
-    ).mean()
+    df["ma_fast"] = df["close"].rolling(window=REGIME_FAST_MA, min_periods=REGIME_FAST_MA).mean()
+    df["ma_slow"] = df["close"].rolling(window=REGIME_SLOW_MA, min_periods=REGIME_SLOW_MA).mean()
     df["atr"] = _compute_atr(df, REGIME_ATR_WINDOW)
 
     last = df.iloc[-1]
@@ -146,7 +150,7 @@ def get_market_state(
     if np.isnan(ma_slow):
         raise ValueError(
             f"Insufficient history to compute {REGIME_SLOW_MA}MA for {symbol}"
-            + (f" as of {as_of_ts.date()}" if as_of_ts is not None else "")
+            + (f" as of {as_of_date!r}" if as_of_date is not None else "")
         )
 
     # --- Simple regime classification ----------------------------------------

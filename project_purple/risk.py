@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
 
 @dataclass
@@ -29,8 +29,12 @@ class RiskConfig:
 def calculate_risk_for_trade(
     entry_price: float,
     atr: float,
-    account_equity: float,
-    config: RiskConfig | None = None
+    account_equity: Optional[float] = None,
+    config: RiskConfig | None = None,
+    *,
+    # Forward-compatible aliases used by trade_plan / execution layers
+    equity: Optional[float] = None,
+    risk_config: RiskConfig | None = None,
 ) -> Dict[str, float]:
     """
     Given an entry price, ATR, and account equity, compute:
@@ -43,6 +47,20 @@ def calculate_risk_for_trade(
 
     This assumes a LONG trade. We can extend to shorts later.
     """
+
+    # Backward/forward compatible parameter aliases:
+    # - Some callers use `equity` instead of `account_equity`
+    # - Some callers use `risk_config` instead of `config`
+    if risk_config is not None and config is None:
+        config = risk_config
+
+    if equity is not None and account_equity is None:
+        account_equity = equity
+
+    if account_equity is None:
+        raise TypeError(
+            "calculate_risk_for_trade requires account_equity (or equity=...)"
+        )
 
     if config is None:
         config = RiskConfig()

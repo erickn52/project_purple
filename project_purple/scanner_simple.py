@@ -8,25 +8,65 @@ import sys
 import numpy as np
 import pandas as pd
 
-from data_loader import load_symbol_daily
-from market_state import get_market_state
-from backtest_v2 import (
-    run_backtest_for_symbol,
-    run_backtest,
-    add_atr as bt_add_atr,
-    add_momentum_pullback_signals as bt_add_signals,
-    validate_ohlcv_dataframe as bt_validate_ohlcv,
-)
-from risk import RiskConfig
+# Internal imports: support both package imports (project_purple.*) and script runs.
+try:
+    from .data_loader import load_symbol_daily
+except ImportError:  # pragma: no cover
+    try:
+        from data_loader import load_symbol_daily
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.data_loader import load_symbol_daily
+
+try:
+    from .market_state import get_market_state
+except ImportError:  # pragma: no cover
+    try:
+        from market_state import get_market_state
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.market_state import get_market_state
+
+try:
+    from .backtest_v2 import (
+        run_backtest_for_symbol,
+        run_backtest,
+        add_atr as bt_add_atr,
+        add_momentum_pullback_signals as bt_add_signals,
+        validate_ohlcv_dataframe as bt_validate_ohlcv,
+    )
+except ImportError:  # pragma: no cover
+    try:
+        from backtest_v2 import (
+            run_backtest_for_symbol,
+            run_backtest,
+            add_atr as bt_add_atr,
+            add_momentum_pullback_signals as bt_add_signals,
+            validate_ohlcv_dataframe as bt_validate_ohlcv,
+        )
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.backtest_v2 import (
+            run_backtest_for_symbol,
+            run_backtest,
+            add_atr as bt_add_atr,
+            add_momentum_pullback_signals as bt_add_signals,
+            validate_ohlcv_dataframe as bt_validate_ohlcv,
+        )
+
+try:
+    from .risk import RiskConfig
+except ImportError:  # pragma: no cover
+    try:
+        from risk import RiskConfig
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.risk import RiskConfig
 
 # Centralized regime policy (single source of truth).
-# Support running both:
-# - from inside project_purple/: python scanner_simple.py
-# - from repo root with sys.path tweaks / module import
 try:
-    from regime_risk import get_regime_policy
-except ModuleNotFoundError:  # pragma: no cover
-    from project_purple.regime_risk import get_regime_policy
+    from .regime_risk import get_regime_policy
+except ImportError:  # pragma: no cover
+    try:
+        from regime_risk import get_regime_policy
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.regime_risk import get_regime_policy
 
 # ---------------------------------------------------------------------------
 # Universe selection settings (FAST screen)
@@ -558,19 +598,12 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         "rank", "symbol", "edge_score", "edge_avg_R", "edge_profit_factor", "edge_trades"
     ]].to_string(index=False))
 
-    print("\n=== Final trading universe ===")
-    print(universe)
-
     return universe
 
 
-def main() -> None:
+if __name__ == "__main__":
     # Usage:
     #   python -u .\project_purple\scanner_simple.py
     #   python -u .\project_purple\scanner_simple.py 2023-12-29
     arg_as_of = sys.argv[1] if len(sys.argv) > 1 else None
     build_universe(as_of_date=arg_as_of)
-
-
-if __name__ == "__main__":
-    main()

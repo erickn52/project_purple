@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
@@ -83,6 +83,37 @@ def _normalize_dates_to_naive_midnight(series: pd.Series, symbol: str) -> pd.Ser
     dt = dt.dt.normalize()
 
     return dt
+
+
+def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]], symbol: str) -> Optional[pd.Timestamp]:
+    """Normalize an as_of_date to tz-naive midnight for daily-bar semantics.
+
+    Accepts strings, datetime-like objects, and tz-aware timestamps.
+    """
+    if as_of_date is None:
+        return None
+
+    s = str(as_of_date).strip()
+    ts = pd.to_datetime(s, errors="coerce", utc=True)
+    if pd.isna(ts):
+        raise ValueError(f"[{symbol}] Invalid as_of_date: {as_of_date!r}")
+
+    # Convert to tz-naive, then normalize to midnight.
+    ts = ts.tz_convert(None).normalize()
+    return ts
+
+
+def _apply_as_of_cutoff(df: pd.DataFrame, as_of_date: Optional[Union[str, pd.Timestamp]], symbol: str) -> pd.DataFrame:
+    """Return a copy of df filtered to rows with date <= as_of_date (inclusive)."""
+    as_of = _normalize_as_of_date(as_of_date, symbol=symbol)
+    if as_of is None:
+        return df
+
+    df2 = df.copy()
+    # Dates should already be tz-naive + normalized, but re-normalize defensively.
+    df2["date"] = pd.to_datetime(df2["date"], errors="coerce").dt.tz_localize(None).dt.normalize()
+    df2 = df2.dropna(subset=["date"]).copy()
+    return df2[df2["date"] <= as_of].copy()
 
 
 def _clean_daily_csv(raw: pd.DataFrame, symbol: str) -> pd.DataFrame:
@@ -225,7 +256,7 @@ def _validate_ohlcv_dataframe(df: pd.DataFrame, symbol: str) -> None:
         raise ValueError(f"[{symbol}] Validation failed: volume < 0 (examples: {bad})")
 
 
-def load_symbol_daily(symbol: str) -> pd.DataFrame:
+def load_symbol_daily(symbol: str, as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> pd.DataFrame:
     """
     Load a single symbol's daily data from CSV.
 
@@ -248,6 +279,10 @@ def load_symbol_daily(symbol: str) -> pd.DataFrame:
     raw = pd.read_csv(csv_path)
     df = _clean_daily_csv(raw=raw, symbol=symbol)
     _validate_ohlcv_dataframe(df=df, symbol=symbol)
+
+    # Optional historical cutoff (daily-bar as-of semantics)
+    df = _apply_as_of_cutoff(df=df, as_of_date=as_of_date, symbol=symbol)
+
     return df
 
 

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import csv
 from datetime import datetime, timezone
@@ -74,6 +74,83 @@ def _append_trade_journal_row(row: dict) -> None:
         if not file_exists:
             writer.writeheader()
         writer.writerow({k: row.get(k, "") for k in fieldnames})
+
+
+def _risk_value(risk: Any, key: str, fallback_key: str | None = None) -> Any:
+    """Read risk values from either a dict return or an object-with-attributes return."""
+    if isinstance(risk, dict):
+        if key in risk:
+            return risk[key]
+        if fallback_key is not None and fallback_key in risk:
+            return risk[fallback_key]
+        return None
+    if hasattr(risk, key):
+        return getattr(risk, key)
+    if fallback_key is not None and hasattr(risk, fallback_key):
+        return getattr(risk, fallback_key)
+    return None
+
+
+def _fmt_price(x: Any) -> str:
+    try:
+        return f"{float(x):.2f}"
+    except Exception:
+        return ""
+
+
+def _fmt_money(x: Any) -> str:
+    try:
+        return f"{float(x):,.2f}"
+    except Exception:
+        return ""
+
+
+def _fmt_pct(x: Any) -> str:
+    try:
+        return f"{float(x) * 100:.3f}%"
+    except Exception:
+        return ""
+
+
+def _fmt_date(x: Any) -> str:
+    try:
+        ts = pd.to_datetime(x)
+        return ts.strftime("%Y-%m-%d")
+    except Exception:
+        return str(x)
+
+
+def _print_trade_plan_rows(plan: dict) -> None:
+    """Pretty-print the plan in row format (terminal-friendly)."""
+    rc = plan.get("risk_config")
+
+    print("\n=== TRADE PLAN (Policy A) ===")
+    print(f"{'symbol':>18}: {plan.get('symbol', '')}")
+    print(f"{'as_of_date':>18}: {_fmt_date(plan.get('as_of_date'))}")
+    print(f"{'regime':>18}: {plan.get('regime', '')}")
+    print(f"{'risk_multiplier':>18}: {plan.get('risk_multiplier', '')}")
+
+    # Risk config printed as a small block
+    if rc is not None:
+        print(f"{'risk_config':>18}:")
+        print(f"{'':>18}  risk_per_trade_pct      = {_fmt_pct(getattr(rc, 'risk_per_trade_pct', None))}")
+        print(f"{'':>18}  atr_stop_multiple       = {getattr(rc, 'atr_stop_multiple', '')}")
+        print(f"{'':>18}  atr_target_multiple     = {getattr(rc, 'atr_target_multiple', '')}")
+        print(f"{'':>18}  max_pos_pct_of_equity   = {_fmt_pct(getattr(rc, 'max_position_pct_of_equity', None))}")
+        print(f"{'':>18}  min_shares              = {getattr(rc, 'min_shares', '')}")
+
+    print(f"{'entry_price':>18}: {_fmt_price(plan.get('entry_price'))}")
+    print(f"{'stop_price':>18}: {_fmt_price(plan.get('stop_price'))}")
+    print(f"{'target_price':>18}: {_fmt_price(plan.get('target_price'))}")
+
+    shares = plan.get("shares")
+    try:
+        shares_disp = str(int(float(shares))) if shares is not None else ""
+    except Exception:
+        shares_disp = str(shares) if shares is not None else ""
+
+    print(f"{'shares':>18}: {shares_disp}")
+    print(f"{'dollars_at_risk':>18}: {_fmt_money(plan.get('dollars_at_risk'))}")
 
 
 def build_trade_plan(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Optional[dict]:
@@ -165,7 +242,8 @@ def build_trade_plan(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> O
 
     # NOTE:
     # We intentionally rely on data_loader.load_symbol_daily() for validation.
-    df = load_symbol_daily(symbol)
+    # (HR-3 already confirmed complete in Codex report.)
+    df = load_symbol_daily(symbol, as_of_date=as_of_date)
     df = df.sort_values("date").reset_index(drop=True)
 
     # Indicators + signals reused from backtest module for consistency.
@@ -213,17 +291,23 @@ def build_trade_plan(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> O
         equity=100_000.0,  # planning equity placeholder; execution layer will replace
     )
 
+    entry_price = float(_risk_value(risk, "entry_price") or 0.0)
+    stop_price = float(_risk_value(risk, "stop_price") or 0.0)
+    target_price = float(_risk_value(risk, "target_price") or 0.0)
+    shares = _risk_value(risk, "shares")
+    dollars_at_risk = _risk_value(risk, "dollars_at_risk", fallback_key="dollar_risk")
+
     plan = {
         "symbol": symbol,
         "as_of_date": pd.to_datetime(last["date"]),
         "regime": state.regime,
         "risk_multiplier": risk_mult,
         "risk_config": risk_config,
-        "entry_price": risk.entry_price,
-        "stop_price": risk.stop_price,
-        "target_price": risk.target_price,
-        "shares": risk.shares,
-        "dollars_at_risk": risk.dollars_at_risk,
+        "entry_price": entry_price,
+        "stop_price": stop_price,
+        "target_price": target_price,
+        "shares": shares,
+        "dollars_at_risk": dollars_at_risk,
     }
 
     _append_trade_journal_row(
@@ -234,16 +318,14 @@ def build_trade_plan(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> O
             "trade_long_allowed": trade_long_allowed,
             "risk_multiplier": risk_mult,
             "symbol": symbol,
-            "entry_price": risk.entry_price,
-            "stop_price": risk.stop_price,
-            "target_price": risk.target_price,
-            "shares": risk.shares,
-            "dollars_at_risk": risk.dollars_at_risk,
+            "entry_price": entry_price,
+            "stop_price": stop_price,
+            "target_price": target_price,
+            "shares": shares,
+            "dollars_at_risk": dollars_at_risk,
             "note": "planned",
         }
     )
 
-    print("\n=== TRADE PLAN (Policy A) ===")
-    print(plan)
-
+    _print_trade_plan_rows(plan)
     return plan
