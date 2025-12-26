@@ -258,7 +258,7 @@ def build_trade_plan(
 
     last = usable.iloc[-1]
 
-    # ---- 3.5) ENTRY SIGNAL ENFORCEMENT (Step 2) ----
+    # ---- 3.5) ENTRY SIGNAL ENFORCEMENT ----
     # Only plan a trade when today's signal says "on".
     sig_val = last.get("signal") if isinstance(last, pd.Series) else None
     try:
@@ -295,7 +295,6 @@ def build_trade_plan(
 
     BASE_RISK_PER_TRADE_PCT = 0.0075  # 0.75% baseline (we'll centralize later)
 
-    # IMPORTANT: use only fields that exist in RiskConfig (per risk.py)
     risk_config = RiskConfig(
         risk_per_trade_pct=BASE_RISK_PER_TRADE_PCT * risk_mult,
         atr_stop_multiple=1.5,
@@ -314,8 +313,49 @@ def build_trade_plan(
     entry_price = _risk_value(risk, "entry_price")
     stop_price = _risk_value(risk, "stop_price")
     target_price = _risk_value(risk, "target_price")
-    shares = _risk_value(risk, "shares")
+    shares_raw = _risk_value(risk, "shares")
     dollars_at_risk = _risk_value(risk, "dollars_at_risk", fallback_key="dollar_risk")
+
+    # ---- STEP 3: Block zero-share "plans" ----
+    # Risk sizing can legitimately return 0 shares when even 1 share violates your risk rules.
+    # In that case, the system must return NO TRADE (not "planned").
+    try:
+        shares_int = int(float(shares_raw)) if shares_raw is not None else 0
+    except Exception:
+        shares_int = 0
+
+    if shares_int <= 0:
+        meta.update(
+            {
+                "status": "zero_shares",
+                "note": "zero_shares",
+                "as_of_date": pd.to_datetime(last["date"]) if "date" in last else None,
+                "risk_config": risk_config,
+                "entry_price": float(entry_price) if entry_price is not None else None,
+                "stop_price": float(stop_price) if stop_price is not None else None,
+                "target_price": float(target_price) if target_price is not None else None,
+                "shares": 0,
+                "dollars_at_risk": dollars_at_risk,
+            }
+        )
+
+        _append_trade_journal_row(
+            {
+                "timestamp_utc": now_utc,
+                "as_of_date": str(as_of_date) if as_of_date is not None else "",
+                "regime": state.regime,
+                "trade_long_allowed": trade_long_allowed,
+                "risk_multiplier": risk_mult,
+                "symbol": symbol,
+                "entry_price": meta["entry_price"] if meta["entry_price"] is not None else "",
+                "stop_price": meta["stop_price"] if meta["stop_price"] is not None else "",
+                "target_price": meta["target_price"] if meta["target_price"] is not None else "",
+                "shares": 0,
+                "dollars_at_risk": dollars_at_risk if dollars_at_risk is not None else "",
+                "note": "zero_shares",
+            }
+        )
+        return meta if return_meta else None
 
     meta.update(
         {
@@ -326,7 +366,7 @@ def build_trade_plan(
             "entry_price": float(entry_price) if entry_price is not None else None,
             "stop_price": float(stop_price) if stop_price is not None else None,
             "target_price": float(target_price) if target_price is not None else None,
-            "shares": shares,
+            "shares": shares_int,
             "dollars_at_risk": dollars_at_risk,
         }
     )
@@ -342,7 +382,7 @@ def build_trade_plan(
             "entry_price": meta["entry_price"] if meta["entry_price"] is not None else "",
             "stop_price": meta["stop_price"] if meta["stop_price"] is not None else "",
             "target_price": meta["target_price"] if meta["target_price"] is not None else "",
-            "shares": shares if shares is not None else "",
+            "shares": shares_int,
             "dollars_at_risk": dollars_at_risk if dollars_at_risk is not None else "",
             "note": meta.get("note", ""),
         }
@@ -357,6 +397,6 @@ def build_trade_plan(
         "entry_price": meta["entry_price"],
         "stop_price": meta["stop_price"],
         "target_price": meta["target_price"],
-        "shares": shares,
+        "shares": shares_int,
         "dollars_at_risk": dollars_at_risk,
     }
