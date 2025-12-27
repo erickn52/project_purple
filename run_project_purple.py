@@ -100,8 +100,8 @@ def _parse_args() -> argparse.Namespace:
         dest="open_price",
         default=None,
         help=(
-            "Optional actual/expected market open price. "
-            "If provided, Project Purple will evaluate gap-up OR gap-down risk."
+            "Optional actual OPEN/FILL price you expect to enter at. "
+            "If provided, Project Purple will evaluate gap-up OR gap-down risk and print a recomputed ticket."
         ),
     )
     p.add_argument(
@@ -115,11 +115,6 @@ def _parse_args() -> argparse.Namespace:
         type=float,
         default=0.50,
         help="Max allowed gap above planned entry, measured in ATR units (0.50 = half an ATR). Default: 0.50.",
-    )
-    p.add_argument(
-        "--recompute-at-open",
-        action="store_true",
-        help="If --open is provided AND the gap check passes, recompute entry/stop/target/shares using that open price.",
     )
 
     return p.parse_args()
@@ -233,7 +228,7 @@ def _safe_float(x: Any) -> Optional[float]:
 
 
 def _print_gap_risk_check(result: dict, args: argparse.Namespace) -> None:
-    """Gap-risk check formatted for premarket, and supports BOTH gap up + gap down."""
+    """Premarket gap-risk check (GAP UP + GAP DOWN), with recomputed ticket when --open is provided."""
     if result.get("status") != "planned":
         return
 
@@ -245,7 +240,7 @@ def _print_gap_risk_check(result: dict, args: argparse.Namespace) -> None:
 
     try:
         from project_purple.data_loader import load_symbol_daily
-        from project_purple.backtest_v2 import add_atr, SLIPPAGE_PCT
+        from project_purple.backtest_v2 import add_atr
         from project_purple.risk import calculate_risk_for_trade
     except Exception as e:
         print("\n=== GAP-RISK CHECK (premarket) ===")
@@ -267,19 +262,20 @@ def _print_gap_risk_check(result: dict, args: argparse.Namespace) -> None:
         atr = None
         atr_err = str(e)
 
-    raw_open = _safe_float(getattr(args, "open_price", None))
+    open_fill = _safe_float(getattr(args, "open_price", None))
+
     gap_dir = None  # "UP" | "DOWN" | None
-    if raw_open is not None:
-        if raw_open > planned_entry:
+    if open_fill is not None:
+        if open_fill > planned_entry:
             gap_dir = "UP"
-        elif raw_open < planned_entry:
+        elif open_fill < planned_entry:
             gap_dir = "DOWN"
 
     header = "=== GAP-RISK CHECK (premarket) ==="
     if gap_dir == "UP":
-        header = _color(header, "\033[92m")
+        header = _color(header, "\033[92m")  # green
     elif gap_dir == "DOWN":
-        header = _color(header, "\033[91m")
+        header = _color(header, "\033[91m")  # red
     print("\n" + header)
 
     if atr is None:
@@ -291,14 +287,17 @@ def _print_gap_risk_check(result: dict, args: argparse.Namespace) -> None:
     gap_max_pct = float(getattr(args, "gap_max_pct", 0.03))
     gap_max_atr = float(getattr(args, "gap_max_atr", 0.50))
 
+    # GAP UP threshold: choose the lower (stricter) of percent vs ATR units
     pct_limit = planned_entry * (1.0 + gap_max_pct)
     atr_limit = planned_entry + float(atr) * gap_max_atr
     max_entry_gap_up = min(pct_limit, atr_limit)
 
+    # GAP DOWN “too tight to stop” cutoff:
+    # If (entry - stop) < 0.33 * ATR => NO TRADE
     too_tight_mult = 0.33
-    max_entry_gap_down = None
+    min_entry_gap_down = None
     if planned_stop is not None:
-        max_entry_gap_down = planned_stop + (too_tight_mult * float(atr))
+        min_entry_gap_down = planned_stop + (too_tight_mult * float(atr))
 
     print(f"Planned entry:        {_fmt_price(planned_entry)}")
     if planned_stop is not None:
@@ -306,12 +305,13 @@ def _print_gap_risk_check(result: dict, args: argparse.Namespace) -> None:
     print(f"ATR (14d):            {_fmt_price(float(atr))}")
 
     print(f"Max acceptable entry if GAP UP:   {_fmt_price(max_entry_gap_up)}")
-    if max_entry_gap_down is not None:
-        print(f"Max acceptable entry if GAP DOWN: {_fmt_price(max_entry_gap_down)}")
+    if min_entry_gap_down is not None:
+        # Keep your label (even though mathematically this is a *minimum* acceptable entry)
+        print(f"Max acceptable entry if GAP DOWN: {_fmt_price(min_entry_gap_down)}")
 
     def _print_ticket(title: str, entry_for_ticket: float) -> None:
         rc = result.get("risk_config")
-        print(f"\n--- Ticket at max acceptable entry - {title} ---")
+        print(f"\n--- Ticket ({title}) ---")
         if rc is None:
             print("Unavailable: risk_config missing from plan result.")
             return
@@ -339,73 +339,39 @@ def _print_gap_risk_check(result: dict, args: argparse.Namespace) -> None:
         except Exception as e:
             print("Failed to compute:", str(e))
 
-    if raw_open is None:
-        _print_ticket("GAP UP", float(max_entry_gap_up))
-        if max_entry_gap_down is not None:
-            _print_ticket("GAP DOWN", float(max_entry_gap_down))
+    # If no open/fill price provided: print worst-case boundary tickets for review
+    if open_fill is None:
+        _print_ticket(f"at max acceptable entry — GAP UP", float(max_entry_gap_up))
+        if min_entry_gap_down is not None:
+            _print_ticket(f"at max acceptable entry — GAP DOWN", float(min_entry_gap_down))
         print("Open price:           (not provided)")
-        print("Action:               At the open, compare price to the thresholds above.")
+        print("Action:               At the open, compare your expected fill to the thresholds above.")
         return
 
-    expected_entry = float(raw_open) * (1.0 + float(SLIPPAGE_PCT))
+    # With open/fill provided: decide SKIP/OK, and if OK print a recomputed ticket using open/fill
+    print(f"Open/fill price:      {_fmt_price(open_fill)}")
 
-    print(f"Open price:           {_fmt_price(raw_open)}")
-    print(f"Expected entry:       {_fmt_price(expected_entry)}  (open + slippage)")
-
-    if expected_entry > float(max_entry_gap_up):
+    # GAP UP fail
+    if open_fill > float(max_entry_gap_up):
         print(_color("Action:               SKIP", "\033[91m"), "— gap up too large.")
-        _print_ticket("GAP UP", float(max_entry_gap_up))
+        _print_ticket("at max acceptable entry — GAP UP (boundary)", float(max_entry_gap_up))
         return
 
+    # GAP DOWN fails (stop proximity)
     if planned_stop is not None:
-        if expected_entry <= planned_stop:
-            print(_color("Action:               SKIP", "\033[91m"), "— expected entry is at/below the planned stop.")
-            if max_entry_gap_down is not None:
-                _print_ticket("GAP DOWN", float(max_entry_gap_down))
+        if open_fill <= planned_stop:
+            print(_color("Action:               SKIP", "\033[91m"), "— entry would be at/below the planned stop.")
             return
 
-        if max_entry_gap_down is not None and expected_entry < float(max_entry_gap_down):
+        if min_entry_gap_down is not None and open_fill < float(min_entry_gap_down):
             print(_color("Action:               SKIP", "\033[91m"), f"— too tight: (entry - stop) < {too_tight_mult:.2f}*ATR.")
-            _print_ticket("GAP DOWN", float(max_entry_gap_down))
+            _print_ticket("at max acceptable entry — GAP DOWN (boundary)", float(min_entry_gap_down))
             return
 
-    if gap_dir == "DOWN" and max_entry_gap_down is not None:
-        _print_ticket("GAP DOWN", float(max_entry_gap_down))
-    else:
-        _print_ticket("GAP UP", float(max_entry_gap_up))
-
-    if not bool(getattr(args, "recompute_at_open", False)):
-        print(_color("Action:               OK", "\033[92m"), "— within thresholds.")
-        return
-
-    rc = result.get("risk_config")
-    if rc is None:
-        print("Recompute:            skipped (risk_config missing).")
-        return
-
-    try:
-        r2 = calculate_risk_for_trade(
-            entry_price=float(expected_entry),
-            atr=float(atr),
-            risk_config=rc,
-            equity=100_000.0,
-        )
-
-        print("\n--- Recomputed ticket (using expected entry) ---")
-        print(f"{'entry_price':>18}: {_fmt_price(_safe_float(r2.get('entry_price')))}")
-        print(f"{'stop_price':>18}: {_fmt_price(_safe_float(r2.get('stop_price')))}")
-        print(f"{'target_price':>18}: {_fmt_price(_safe_float(r2.get('target_price')))}")
-
-        shares2 = r2.get("shares")
-        try:
-            shares_disp2 = str(int(float(shares2))) if shares2 is not None else ""
-        except Exception:
-            shares_disp2 = str(shares2) if shares2 is not None else ""
-
-        print(f"{'shares':>18}: {shares_disp2}")
-        print(f"{'dollars_at_risk':>18}: {_fmt_money(_safe_float(r2.get('dollar_risk')))}")
-    except Exception as e:
-        print("Recompute:            failed —", str(e))
+    # If we got here: within thresholds -> OK, recompute ticket at the actual open/fill
+    direction = "GAP UP" if gap_dir == "UP" else ("GAP DOWN" if gap_dir == "DOWN" else "NO GAP")
+    _print_ticket(f"recomputed at OPEN/FILL — {direction}", float(open_fill))
+    print(_color("Action:               OK", "\033[92m"), "— within thresholds.")
 
 
 def main() -> int:
@@ -423,6 +389,7 @@ def main() -> int:
         if args.refresh_only:
             return 0
 
+    # Run trade plan
     try:
         from project_purple.trade_plan import build_trade_plan
 
