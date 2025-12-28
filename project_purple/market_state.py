@@ -28,13 +28,22 @@ except ImportError:  # pragma: no cover
     except ModuleNotFoundError:  # pragma: no cover
         from project_purple.regime_risk import get_regime_policy
 
+# Centralized strategy config (single source of truth for benchmark ticker).
+try:
+    from .config import strategy_config
+except ImportError:  # pragma: no cover
+    try:
+        from config import strategy_config
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.config import strategy_config
+
 
 # Basic parameters for regime detection
 REGIME_FAST_MA = 50
 REGIME_SLOW_MA = 200
 REGIME_ATR_WINDOW = 14
 
-MARKET_SYMBOL = "SPY"  # we can parameterize later if needed
+MARKET_SYMBOL = str(strategy_config.benchmark_ticker).upper()  # e.g., SPY/QQQ/DIA
 
 # Console colors
 GREEN = "\033[92m"
@@ -58,46 +67,34 @@ class MarketState:
     @property
     def trade_long(self) -> bool:
         """
-        Allowed in BULL or CHOPPY, blocked in BEAR.
+        Whether long trades are allowed in this market regime.
 
-        Delegates to regime_risk.py (single source of truth).
+        This uses regime_risk.get_regime_policy() as the single source of truth.
+        NOTE: In this repo, RegimePolicy uses the field name `trade_long`.
         """
-        return bool(get_regime_policy(self.regime).trade_long)
-
-    @property
-    def market_long_ok(self) -> bool:
-        """Backwards-compatible alias used by other modules."""
-        return self.trade_long
+        policy = get_regime_policy(self.regime)
+        return bool(policy.trade_long)
 
     @property
     def risk_multiplier(self) -> float:
         """
-        Multiplier applied to base risk per trade based on market regime.
+        Risk multiplier for position sizing in this market regime.
 
-        Delegates to regime_risk.py (single source of truth).
+        Example:
+          - Bull: 1.00x
+          - Choppy: 0.50x
+          - Bear: 0.00x (no longs)
         """
-        return float(get_regime_policy(self.regime).risk_multiplier)
+        policy = get_regime_policy(self.regime)
+        return float(policy.risk_multiplier)
 
 
-def _compute_atr(df: pd.DataFrame, window: int) -> pd.Series:
-    """Classic True Range ATR, simple moving average."""
-    prev_close = df["close"].shift(1)
-
-    high_low = df["high"] - df["low"]
-    high_prev = (df["high"] - prev_close).abs()
-    low_prev = (df["low"] - prev_close).abs()
-
-    tr = pd.concat([high_low, high_prev, low_prev], axis=1).max(axis=1)
-    atr = tr.rolling(window=window, min_periods=window).mean()
-    return atr
-
-
-def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]]) -> Optional[pd.Timestamp]:
-    if as_of_date is None:
-        return None
-    ts = pd.to_datetime(as_of_date, errors="coerce")
-    if pd.isna(ts):
-        raise ValueError(f"Invalid as_of_date: {as_of_date!r}")
+def _as_timestamp(x: Union[str, pd.Timestamp]) -> pd.Timestamp:
+    """Convert a user input into a tz-naive pandas Timestamp."""
+    ts = pd.Timestamp(x)
+    # normalize timezone-aware timestamps to tz-naive
+    if ts.tzinfo is not None:
+        ts = ts.tz_convert(None)
     return ts
 
 
@@ -106,64 +103,72 @@ def get_market_state(
     as_of_date: Optional[Union[str, pd.Timestamp]] = None,
 ) -> MarketState:
     """
-    Load daily data for the given market symbol (default SPY),
+    Load daily data for the given market symbol (default benchmark ticker),
     compute regime on the most recent bar (or on the bar at/just before as_of_date),
     and return a MarketState object.
 
-    HR2:
-      - If as_of_date is provided, we ONLY use rows with date <= as_of_date.
-        This prevents lookahead bias in historical simulation.
-
-    NOTE: load_symbol_daily() is responsible for applying the inclusive cutoff.
+    Rules:
+      - If as_of_date is provided, we ONLY use rows with date <= as_of_date
+        (no lookahead).
+      - If no eligible rows, raise a ValueError (callers should catch and fail safe).
     """
+    df = load_symbol_daily(symbol)
 
-    df = load_symbol_daily(symbol, as_of_date=as_of_date)
+    # Basic sanity
     if df.empty:
-        raise ValueError(f"No data loaded for symbol {symbol}")
+        raise ValueError(f"No data loaded for market symbol: {symbol}")
 
+    # Ensure date is Timestamp and sorted
+    if "date" not in df.columns:
+        raise ValueError(f"{symbol} dataframe missing required 'date' column")
     df = df.copy()
+    df["date"] = pd.to_datetime(df["date"])
+    df = df.sort_values("date")
 
-    # Normalize / sanitize dates
-    df["date"] = pd.to_datetime(df["date"], errors="coerce")
-    df = df.dropna(subset=["date", "open", "high", "low", "close"]).copy()
-    df = df.sort_values("date").reset_index(drop=True)
-
-    # Data loader already applies as_of_date cutoff (inclusive) when provided.
-
-    if df.empty:
-        raise ValueError(f"No usable rows for symbol {symbol} as of {as_of_date!r}")
+    if as_of_date is not None:
+        asof = _as_timestamp(as_of_date)
+        df = df[df["date"] <= asof].copy()
+        if df.empty:
+            raise ValueError(f"No market rows at or before as_of_date={as_of_date!r}")
 
     # Indicators
-    df["ma_fast"] = df["close"].rolling(window=REGIME_FAST_MA, min_periods=REGIME_FAST_MA).mean()
-    df["ma_slow"] = df["close"].rolling(window=REGIME_SLOW_MA, min_periods=REGIME_SLOW_MA).mean()
-    df["atr"] = _compute_atr(df, REGIME_ATR_WINDOW)
+    df["ma_fast"] = df["close"].rolling(REGIME_FAST_MA).mean()
+    df["ma_slow"] = df["close"].rolling(REGIME_SLOW_MA).mean()
 
-    last = df.iloc[-1]
+    # ATR(14) for context (not strictly required for regime label)
+    tr1 = df["high"] - df["low"]
+    tr2 = (df["high"] - df["close"].shift(1)).abs()
+    tr3 = (df["low"] - df["close"].shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    df["atr"] = tr.rolling(REGIME_ATR_WINDOW).mean()
 
-    close = float(last["close"])
-    ma_fast = float(last["ma_fast"]) if not np.isnan(last["ma_fast"]) else float("nan")
-    ma_slow = float(last["ma_slow"]) if not np.isnan(last["ma_slow"]) else float("nan")
-    atr = float(last["atr"]) if not np.isnan(last["atr"]) else None
-    bar_date = pd.to_datetime(last["date"])
+    latest = df.iloc[-1]
+    close = float(latest["close"])
+    ma_fast = float(latest["ma_fast"]) if pd.notna(latest["ma_fast"]) else np.nan
+    ma_slow = float(latest["ma_slow"]) if pd.notna(latest["ma_slow"]) else np.nan
+    atr = float(latest["atr"]) if pd.notna(latest["atr"]) else None
 
-    # Regime requires slow MA to exist; otherwise results are undefined.
-    if np.isnan(ma_slow):
+    # Require enough data for MA signals
+    if not np.isfinite(ma_fast) or not np.isfinite(ma_slow):
         raise ValueError(
-            f"Insufficient history to compute {REGIME_SLOW_MA}MA for {symbol}"
-            + (f" as of {as_of_date!r}" if as_of_date is not None else "")
+            f"Insufficient data to compute regime MAs for {symbol}: "
+            f"need at least {REGIME_SLOW_MA} rows."
         )
 
-    # --- Simple regime classification ----------------------------------------
-    if close > ma_slow and (not np.isnan(ma_fast)) and ma_fast > ma_slow:
+    # Simple regime rules:
+    # - Bull if close > MA50 and MA50 > MA200
+    # - Bear if close < MA50 and MA50 < MA200
+    # - Else choppy
+    if close > ma_fast and ma_fast > ma_slow:
         regime = "BULL"
-    elif close < ma_slow:
+    elif close < ma_fast and ma_fast < ma_slow:
         regime = "BEAR"
     else:
         regime = "CHOPPY"
 
     return MarketState(
         symbol=symbol,
-        as_of_date=bar_date,
+        as_of_date=pd.Timestamp(latest["date"]),
         regime=regime,
         close=close,
         ma_fast=ma_fast,

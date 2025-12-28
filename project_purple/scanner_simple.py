@@ -68,6 +68,16 @@ except ImportError:  # pragma: no cover
     except ModuleNotFoundError:  # pragma: no cover
         from project_purple.regime_risk import get_regime_policy
 
+# Centralized strategy config (single source of truth for benchmark + universe tickers).
+try:
+    from .config import strategy_config
+except ImportError:  # pragma: no cover
+    try:
+        from config import strategy_config
+    except ModuleNotFoundError:  # pragma: no cover
+        from project_purple.config import strategy_config
+
+
 # ---------------------------------------------------------------------------
 # Universe selection settings (FAST screen)
 # ---------------------------------------------------------------------------
@@ -96,7 +106,7 @@ EDGE_TEST_INITIAL_EQUITY = 100_000.0
 EDGE_TEST_MAX_HOLD_DAYS = 10
 EDGE_TEST_TRAIL_ATR_MULTIPLE = 3.0  # keep in sync with main.py default
 
-# NEW: quality gate so we don't keep "barely-pass" symbols with negative edge_score
+# quality gate so we don't keep "barely-pass" symbols with negative edge_score
 EDGE_MIN_EDGE_SCORE = 0.0  # keep only symbols with edge_score > 0
 
 # Regime behavior
@@ -105,37 +115,19 @@ BULL_MAX_UNIVERSE = 15
 
 BASE_RISK_PER_TRADE_PCT = 0.01  # used only for *recommended* risk in CHOPPY
 
-
-CANDIDATE_SYMBOLS: List[str] = [
-    "AAPL", "AMD", "AMDL", "AMZN", "IBKR",
-    "META", "MSFT", "NVDA", "SPY", "TSLA",
-
-    "PLTR", "SHOP", "UBER", "SNAP", "PINS",
-    "ZM", "CRWD", "NET", "PATH",
-    "OKTA", "HUBS", "DDOG",
-
-    "DKNG", "CROX", "LULU", "ETSY", "RBLX",
-    "CELH", "PTON", "ROKU", "FVRR", "LYFT",
-
-    "RIVN", "LCID", "RUN", "ENPH", "FSLR",
-
-    "SOFI", "COIN", "HOOD",
-
-    "NVAX", "BNTX", "MRNA", "IONS", "REGN",
-
-    "BA", "GE", "UAL", "DAL",
-
-    "WBD", "DIS",
-
-    "OXY", "APA", "FCX", "AA",
-
-    "AFRM", "MDB", "ZS", "TEAM",
-]
+# Single source of truth: benchmark ticker + candidate universe
+BENCHMARK_TICKER = str(strategy_config.benchmark_ticker).upper()
+CANDIDATE_SYMBOLS: List[str] = [str(s).upper() for s in strategy_config.candidate_symbols]
 
 GREEN = "\033[92m"
 RED = "\033[91m"
 YELLOW = "\033[93m"
 RESET = "\033[0m"
+
+
+def _vprint(verbose: bool, msg: str) -> None:
+    if verbose:
+        print(msg)
 
 
 @dataclass
@@ -162,14 +154,6 @@ class UniverseMember:
     edge_fail_reason: str = ""
 
 
-# ---------------------------------------------------------------------------
-# Critical Item #3 hardening:
-# - normalize as_of_date to tz-naive midnight
-# - normalize df["date"] to tz-naive midnight before comparison
-# This prevents lookahead bias bugs caused by tz-aware vs tz-naive comparisons
-# and avoids off-by-one day issues when users pass timezone timestamps.
-# ---------------------------------------------------------------------------
-
 def _normalize_as_of_date(as_of_date: Optional[Union[str, pd.Timestamp]]) -> Optional[pd.Timestamp]:
     if as_of_date is None:
         return None
@@ -191,7 +175,6 @@ def _apply_as_of_cutoff(df: pd.DataFrame, as_of_date: Optional[Union[str, pd.Tim
     df = df.copy()
 
     # Normalize df["date"] the same way we normalize as_of_date (tz-safe, midnight)
-    # so comparisons always work and always mean "date-only".
     dt = pd.to_datetime(df["date"], errors="coerce", utc=True)
     dt = dt.dt.tz_convert(None).dt.normalize()
     df["date"] = dt
@@ -264,9 +247,14 @@ def _edge_score(avg_R: float, profit_factor: float, win_rate_pct: float, max_dd_
     return float((avg_R * 100.0) + pf_term + ((win_rate_pct - 50.0) * 0.2) - (abs(max_dd_pct) * 0.5) + trade_term)
 
 
-def _run_edge_backtest(symbol: str, risk_config: RiskConfig, as_of_date: Optional[Union[str, pd.Timestamp]]) -> pd.DataFrame:
+def _run_edge_backtest(
+    symbol: str,
+    risk_config: RiskConfig,
+    as_of_date: Optional[Union[str, pd.Timestamp]],
+) -> pd.DataFrame:
     ts = _normalize_as_of_date(as_of_date)
 
+    # Live-mode: run the per-symbol helper which uses full available history.
     if ts is None:
         f = io.StringIO()
         with contextlib.redirect_stdout(f):
@@ -280,6 +268,7 @@ def _run_edge_backtest(symbol: str, risk_config: RiskConfig, as_of_date: Optiona
             )
         return trades_df
 
+    # Historical-mode: respect as_of cutoff.
     df = load_symbol_daily(symbol)
     if df.empty:
         return pd.DataFrame()
@@ -375,27 +364,34 @@ def evaluate_symbol(symbol: str, as_of_date: Optional[Union[str, pd.Timestamp]] 
     )
 
 
-def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> List[str]:
+def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None, verbose: bool = False) -> List[str]:
+    """
+    Build the ranked candidate universe.
+
+    Production behavior:
+      - verbose=False (default): NO tables printed. Returns symbols only.
+
+    Diagnostic behavior:
+      - verbose=True: prints the multi-pass screens and edge metrics.
+    """
     market_regime = "UNKNOWN"
     risk_mult = 1.0
     regime_policy = None
 
     try:
-        state = get_market_state(symbol="SPY", as_of_date=as_of_date)
+        state = get_market_state(symbol=BENCHMARK_TICKER, as_of_date=as_of_date)
         market_regime = state.regime
     except Exception as e:
-        print("\nWARNING: Could not determine market regime from SPY.")
-        print(f"Reason: {e}")
-        state = None
+        _vprint(verbose, f"\nWARNING: Could not determine market regime from {BENCHMARK_TICKER}.")
+        _vprint(verbose, f"Reason: {e}")
 
-    # Centralized regime rules (single source of truth)
     try:
         regime_policy = get_regime_policy(market_regime)
         risk_mult = float(regime_policy.risk_multiplier)
     except Exception as e:
-        print("\nWARNING: Could not resolve regime policy from regime_risk.py.")
-        print(f"Regime: {market_regime!r}")
-        print(f"Reason: {e}")
+        _vprint(verbose, "\nWARNING: Could not resolve regime policy from regime_risk.py.")
+        _vprint(verbose, f"Regime: {market_regime!r}")
+        _vprint(verbose, f"Reason: {e}")
         regime_policy = None
         risk_mult = 1.0
 
@@ -404,10 +400,10 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         try:
             members.append(evaluate_symbol(symbol, as_of_date=as_of_date))
         except Exception as e:
-            print(f"WARNING: could not evaluate {symbol}: {e}")
+            _vprint(verbose, f"WARNING: could not evaluate {symbol}: {e}")
 
     if not members:
-        print("No symbols evaluated successfully (no data found).")
+        _vprint(verbose, "No symbols evaluated successfully (no data found).")
         return []
 
     df_all = pd.DataFrame([m.__dict__ for m in members])
@@ -419,19 +415,19 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
 
     df_sorted_fast = df.sort_values(by="score", ascending=False).reset_index(drop=True)
 
-    df_print_fast = df_sorted_fast.copy()
-    df_print_fast["avg_volume"] = df_print_fast["avg_volume"].round(0).astype("Int64")
-    df_print_fast["last_close"] = df_print_fast["last_close"].round(2)
-    df_print_fast["score"] = df_print_fast["score"].round(4)
-    df_print_fast["ret20"] = (df_print_fast["ret20"] * 100.0).round(2)
-    df_print_fast["atr_pct"] = (df_print_fast["atr_pct"] * 100.0).round(2)
+    if verbose:
+        df_print_fast = df_sorted_fast.copy()
+        df_print_fast["avg_volume"] = df_print_fast["avg_volume"].round(0).astype("Int64")
+        df_print_fast["last_close"] = df_print_fast["last_close"].round(2)
+        df_print_fast["score"] = df_print_fast["score"].round(4)
+        df_print_fast["ret20"] = (df_print_fast["ret20"] * 100.0).round(2)
+        df_print_fast["atr_pct"] = (df_print_fast["atr_pct"] * 100.0).round(2)
 
-    print("\n=== PASS 1: Fast screen (price + liquidity + simple score) ===")
-    print(df_print_fast[[
-        "symbol", "included", "last_close", "avg_volume", "score", "ret20", "atr_pct", "ma_fast", "ma_slow"
-    ]].to_string(index=False))
+        print("\n=== PASS 1: Fast screen (price + liquidity + simple score) ===")
+        print(df_print_fast[[
+            "symbol", "included", "last_close", "avg_volume", "score", "ret20", "atr_pct", "ma_fast", "ma_slow"
+        ]].to_string(index=False))
 
-    # Use centralized trade_long gate; fall back to prior behavior if policy unavailable.
     trade_long_allowed = True
     if regime_policy is not None:
         trade_long_allowed = bool(regime_policy.trade_long)
@@ -439,8 +435,8 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         trade_long_allowed = (market_regime != "BEAR")
 
     if not trade_long_allowed:
-        print(f"\n=== MARKET REGIME: {RED}{market_regime}{RESET} ===")
-        print("Rule: do not trade longs when trade_long=False. Universe is empty.")
+        _vprint(verbose, f"\n=== MARKET REGIME: {RED}{market_regime}{RESET} ===")
+        _vprint(verbose, "Rule: do not trade longs when trade_long=False. Universe is empty.")
         return []
 
     risk_config = RiskConfig(
@@ -465,7 +461,7 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
             max_dd = float("nan")
             edge_pass = False
             reason = "no_trades"
-            score = float("nan")
+            edge_sc = float("nan")
         else:
             win_rate = float((trades_df["pnl_dollars"] > 0).mean() * 100.0)
             avg_R = float(trades_df["R"].mean())
@@ -475,7 +471,7 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
                 ignore_index=True,
             )
             max_dd = _max_drawdown_pct(equity_curve)
-            score = _edge_score(avg_R=avg_R, profit_factor=pf, win_rate_pct=win_rate, max_dd_pct=max_dd, n_trades=n_trades)
+            edge_sc = _edge_score(avg_R=avg_R, profit_factor=pf, win_rate_pct=win_rate, max_dd_pct=max_dd, n_trades=n_trades)
 
             reasons = []
             if n_trades < EDGE_MIN_TRADES:
@@ -497,7 +493,7 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
             "edge_avg_R": avg_R,
             "edge_profit_factor": pf,
             "edge_max_dd_pct": max_dd,
-            "edge_score": score,
+            "edge_score": edge_sc,
             "edge_pass": edge_pass,
             "edge_fail_reason": reason,
         })
@@ -512,33 +508,32 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
     df2["edge_pass"] = df2["edge_pass"].astype("boolean").fillna(False).astype(bool)
     df2["edge_fail_reason"] = df2["edge_fail_reason"].fillna("not_tested")
 
-    df_print_edge = df2.copy()
-    df_print_edge["edge_win_rate_pct"] = df_print_edge["edge_win_rate_pct"].round(1)
-    df_print_edge["edge_avg_R"] = df_print_edge["edge_avg_R"].round(3)
-    df_print_edge["edge_profit_factor"] = df_print_edge["edge_profit_factor"].replace([np.inf], 999.0).round(2)
-    df_print_edge["edge_max_dd_pct"] = df_print_edge["edge_max_dd_pct"].round(1)
-    df_print_edge["edge_score"] = df_print_edge["edge_score"].round(2)
+    if verbose:
+        df_print_edge = df2.copy()
+        df_print_edge["edge_win_rate_pct"] = df_print_edge["edge_win_rate_pct"].round(1)
+        df_print_edge["edge_avg_R"] = df_print_edge["edge_avg_R"].round(3)
+        df_print_edge["edge_profit_factor"] = df_print_edge["edge_profit_factor"].replace([np.inf], 999.0).round(2)
+        df_print_edge["edge_max_dd_pct"] = df_print_edge["edge_max_dd_pct"].round(1)
+        df_print_edge["edge_score"] = df_print_edge["edge_score"].round(2)
 
-    print("\n=== PASS 2: Edge-response filter (per-symbol backtest metrics) ===")
-    print(df_print_edge[[
-        "symbol", "included", "edge_pass", "edge_fail_reason",
-        "edge_score", "edge_trades", "edge_avg_R", "edge_profit_factor", "edge_win_rate_pct", "edge_max_dd_pct"
-    ]].sort_values(by=["edge_pass", "edge_score"], ascending=[False, False]).to_string(index=False))
+        print("\n=== PASS 2: Edge-response filter (per-symbol backtest metrics) ===")
+        print(df_print_edge[[
+            "symbol", "included", "edge_pass", "edge_fail_reason",
+            "edge_score", "edge_trades", "edge_avg_R", "edge_profit_factor", "edge_win_rate_pct", "edge_max_dd_pct"
+        ]].sort_values(by=["edge_pass", "edge_score"], ascending=[False, False]).to_string(index=False))
 
-    # Shared “momentum alignment” condition (used in both CHOPPY and BULL)
     momentum_mask = (df2["ret20"] > 0) & (df2["ma_fast"] > df2["ma_slow"])
-
-    # Shared “edge quality” condition: exclude negative edge_score even if edge_pass=True
     edge_quality_mask = (df2["edge_score"] > EDGE_MIN_EDGE_SCORE)
 
     if market_regime == "CHOPPY":
-        print(f"\n=== MARKET REGIME: {YELLOW}CHOPPY{RESET} ===")
-        print("Rules:")
-        print("  - Keep only edge-pass symbols")
-        print("  - Momentum alignment: ret20 > 0 AND ma_fast > ma_slow")
-        print(f"  - Edge quality gate: edge_score > {EDGE_MIN_EDGE_SCORE:.2f}")
-        print(f"  - Keep top {CHOPPY_MAX_UNIVERSE} by edge_score")
-        print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%} (1/2 of normal)")
+        if verbose:
+            print(f"\n=== MARKET REGIME: {YELLOW}CHOPPY{RESET} ===")
+            print("Rules:")
+            print("  - Keep only edge-pass symbols")
+            print("  - Momentum alignment: ret20 > 0 AND ma_fast > ma_slow")
+            print(f"  - Edge quality gate: edge_score > {EDGE_MIN_EDGE_SCORE:.2f}")
+            print(f"  - Keep top {CHOPPY_MAX_UNIVERSE} by edge_score")
+            print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%} (1/2 of normal)")
 
         choppy_mask = (
             (df2["included"] == True) &
@@ -549,14 +544,15 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         df_final = df2[choppy_mask].copy()
         df_final = df_final.sort_values(by="edge_score", ascending=False).head(CHOPPY_MAX_UNIVERSE)
     else:
-        regime_str = f"{GREEN}BULL{RESET}" if market_regime == "BULL" else f"{YELLOW}{market_regime}{RESET}"
-        print(f"\n=== MARKET REGIME: {regime_str} ===")
-        print("Rules:")
-        print("  - Keep only edge-pass symbols")
-        print("  - Momentum alignment: ret20 > 0 AND ma_fast > ma_slow")
-        print(f"  - Edge quality gate: edge_score > {EDGE_MIN_EDGE_SCORE:.2f}")
-        print(f"  - Keep top {BULL_MAX_UNIVERSE} by edge_score")
-        print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%}")
+        if verbose:
+            regime_str = f"{GREEN}BULL{RESET}" if market_regime == "BULL" else f"{YELLOW}{market_regime}{RESET}"
+            print(f"\n=== MARKET REGIME: {regime_str} ===")
+            print("Rules:")
+            print("  - Keep only edge-pass symbols")
+            print("  - Momentum alignment: ret20 > 0 AND ma_fast > ma_slow")
+            print(f"  - Edge quality gate: edge_score > {EDGE_MIN_EDGE_SCORE:.2f}")
+            print(f"  - Keep top {BULL_MAX_UNIVERSE} by edge_score")
+            print(f"  - Recommended risk per trade: {BASE_RISK_PER_TRADE_PCT * risk_mult:.3%}")
 
         bull_mask = (
             (df2["included"] == True) &
@@ -567,37 +563,38 @@ def build_universe(as_of_date: Optional[Union[str, pd.Timestamp]] = None) -> Lis
         df_final = df2[bull_mask].copy()
         df_final = df_final.sort_values(by="edge_score", ascending=False).head(BULL_MAX_UNIVERSE)
 
-    universe = df_final["symbol"].tolist()
-
     if df_final.empty:
-        print("\n=== PASS 3: Final universe (ranked) ===")
-        print("No symbols passed the edge filter + regime rules.")
+        _vprint(verbose, "\n=== PASS 3: Final universe (ranked) ===")
+        _vprint(verbose, "No symbols passed the edge filter + regime rules.")
         return []
 
     df_final_print = df_final.copy()
     df_final_print["rank"] = np.arange(1, len(df_final_print) + 1)
-    df_final_print["last_close"] = df_final_print["last_close"].round(2)
-    df_final_print["ret20"] = (df_final_print["ret20"] * 100.0).round(2)
-    df_final_print["atr_pct"] = (df_final_print["atr_pct"] * 100.0).round(2)
-    df_final_print["score"] = df_final_print["score"].round(4)
-    df_final_print["edge_score"] = df_final_print["edge_score"].round(2)
-    df_final_print["edge_avg_R"] = df_final_print["edge_avg_R"].round(3)
-    df_final_print["edge_profit_factor"] = df_final_print["edge_profit_factor"].replace([np.inf], 999.0).round(2)
-    df_final_print["edge_win_rate_pct"] = df_final_print["edge_win_rate_pct"].round(1)
-    df_final_print["edge_max_dd_pct"] = df_final_print["edge_max_dd_pct"].round(1)
 
-    print("\n=== PASS 3: Final universe (ranked) ===")
-    print(df_final_print[[
-        "rank", "symbol",
-        "edge_score", "edge_trades", "edge_avg_R", "edge_profit_factor", "edge_win_rate_pct", "edge_max_dd_pct",
-        "score", "ret20", "atr_pct"
-    ]].to_string(index=False))
+    if verbose:
+        df_final_print["last_close"] = df_final_print["last_close"].round(2)
+        df_final_print["ret20"] = (df_final_print["ret20"] * 100.0).round(2)
+        df_final_print["atr_pct"] = (df_final_print["atr_pct"] * 100.0).round(2)
+        df_final_print["score"] = df_final_print["score"].round(4)
+        df_final_print["edge_score"] = df_final_print["edge_score"].round(2)
+        df_final_print["edge_avg_R"] = df_final_print["edge_avg_R"].round(3)
+        df_final_print["edge_profit_factor"] = df_final_print["edge_profit_factor"].replace([np.inf], 999.0).round(2)
+        df_final_print["edge_win_rate_pct"] = df_final_print["edge_win_rate_pct"].round(1)
+        df_final_print["edge_max_dd_pct"] = df_final_print["edge_max_dd_pct"].round(1)
 
-    print("\n=== Top 5 picks ===")
-    print(df_final_print.head(5)[[
-        "rank", "symbol", "edge_score", "edge_avg_R", "edge_profit_factor", "edge_trades"
-    ]].to_string(index=False))
+        print("\n=== PASS 3: Final universe (ranked) ===")
+        print(df_final_print[[
+            "rank", "symbol",
+            "edge_score", "edge_trades", "edge_avg_R", "edge_profit_factor", "edge_win_rate_pct", "edge_max_dd_pct",
+            "score", "ret20", "atr_pct"
+        ]].to_string(index=False))
 
+        print("\n=== Top 5 picks ===")
+        print(df_final_print.head(5)[[
+            "rank", "symbol", "edge_score", "edge_avg_R", "edge_profit_factor", "edge_trades"
+        ]].to_string(index=False))
+
+    universe = df_final_print["symbol"].tolist()
     return universe
 
 
@@ -606,4 +603,4 @@ if __name__ == "__main__":
     #   python -u .\project_purple\scanner_simple.py
     #   python -u .\project_purple\scanner_simple.py 2023-12-29
     arg_as_of = sys.argv[1] if len(sys.argv) > 1 else None
-    build_universe(as_of_date=arg_as_of)
+    build_universe(as_of_date=arg_as_of, verbose=True)

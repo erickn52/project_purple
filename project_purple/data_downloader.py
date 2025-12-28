@@ -6,13 +6,15 @@ from typing import List, Optional
 import pandas as pd
 import yfinance as yf
 
-# Use the same candidate universe as the scanner so everything stays in sync.
+# Single source of truth for default tickers (P1 config centralization)
 try:
-    from project_purple.scanner_simple import CANDIDATE_SYMBOLS  # type: ignore
-except Exception:
-    from scanner_simple import CANDIDATE_SYMBOLS  # type: ignore
+    from project_purple.config import strategy_config  # type: ignore
+except Exception:  # pragma: no cover
+    # Allows running as a script from inside the package folder in some environments
+    from config import strategy_config  # type: ignore
 
-TICKERS = CANDIDATE_SYMBOLS
+
+TICKERS = strategy_config.candidate_symbols
 
 
 def _repo_root() -> Path:
@@ -148,6 +150,9 @@ def download_and_save_daily_data(
     - ALWAYS writes clean columns: date,symbol,open,high,low,close,volume
     - If <SYMBOL>_daily.csv exists, we create a timestamped backup first, then replace it.
     - Uses atomic write (tmp -> replace) to avoid half-written files.
+
+    Defaults:
+    - If symbols is None, uses strategy_config.candidate_symbols (single source of truth).
     """
     data_dir = _canonical_data_dir()
     use_symbols = [s.upper().strip() for s in (symbols if symbols else list(TICKERS))]
@@ -245,7 +250,8 @@ def _parse_args() -> argparse.Namespace:
         "--symbols",
         nargs="*",
         default=None,
-        help="Optional list of symbols to download (e.g., --symbols SPY AAPL). If omitted, uses scanner CANDIDATE_SYMBOLS.",
+        help="Optional list of symbols to download (e.g., --symbols SPY AAPL). "
+             "If omitted, uses strategy_config.candidate_symbols.",
     )
     p.add_argument("--period", default="10y", help="yfinance period (default: 10y)")
     p.add_argument("--interval", default="1d", help="yfinance interval (default: 1d)")
